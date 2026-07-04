@@ -1,0 +1,48 @@
+{
+  "name": "pi-tmux-session-map",
+  "version": "0.1.0",
+  "description": "Record which Pi session runs in which tmux pane so tmux-resurrect can restore the exact session after a tmux server restart.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "tmux",
+    "tmux-resurrect"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/patlux/pi-tmux-session-map.git"
+  },
+  "homepage": "https://github.com/patlux/pi-tmux-session-map#readme",
+  "bugs": {
+    "url": "https://github.com/patlux/pi-tmux-session-map/issues"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm pack --dry-run"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
