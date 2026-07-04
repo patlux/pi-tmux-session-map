@@ -5,6 +5,7 @@ import {
   mappingFileName,
   normalizePaneKey,
   sanitizeKey,
+  statusFileName,
 } from "../src/domain/pane-key.ts";
 
 test("sanitizeKey keeps safe characters", () => {
@@ -28,6 +29,10 @@ test("sanitizeKey matches shell `tr -c 'A-Za-z0-9._-' '_'` for ASCII input", () 
 
 test("mappingFileName appends .session suffix", () => {
   assert.equal(mappingFileName("main:1.0"), "main_1.0.session");
+});
+
+test("statusFileName appends .json suffix", () => {
+  assert.equal(statusFileName("main:1.0"), "main_1.0.json");
 });
 
 test("normalizePaneKey trims tmux output", () => {

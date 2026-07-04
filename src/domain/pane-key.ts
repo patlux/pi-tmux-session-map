@@ -29,6 +29,11 @@ export function mappingFileName(key: string): string {
   return `${sanitizeKey(key)}.session`;
 }
 
+/** File name of the tws status file for a raw pane key. */
+export function statusFileName(key: string): string {
+  return `${sanitizeKey(key)}.json`;
+}
+
 /** Normalize raw `tmux display-message` output into a pane key, if usable. */
 export function normalizePaneKey(stdout: string): string | undefined {
   const key = stdout.trim();
