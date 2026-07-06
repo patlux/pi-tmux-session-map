@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { cleanupStaleSessionMappings, cleanupStaleTempFiles, ensureDirectory, writeAtomic } from "./domain/atomic-write.ts";
+import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic } from "./domain/atomic-write.ts";
 import { createAsyncQueue } from "./domain/async-queue.ts";
 import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
 import { PANE_KEY_FORMAT, defaultStateDir, mappingFileName, statusFileName } from "./domain/pane-key.ts";
@@ -85,8 +85,10 @@ async function writeTwsStatus(
 ): Promise<void> {
   const payload = buildTwsStatusPayload(info, session, state, updatedAtMs, startedAtMs, finishedAtMs);
 
+  const fileName = statusFileName(info.paneKey);
   await ensureDirectory(twsStatusDir);
-  await writeAtomic(join(twsStatusDir, statusFileName(info.paneKey)), serializeStatusPayload(payload), 0o600);
+  await writeAtomic(join(twsStatusDir, fileName), serializeStatusPayload(payload), 0o600);
+  await cleanupSupersededStatusFiles(twsStatusDir, fileName, info.paneId);
   await touchTwsTrigger();
 }
 

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { cleanupStaleSessionMappings, cleanupStaleTempFiles, ensureDirectory, writeAtomic } from "../src/domain/atomic-write.ts";
+import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic } from "../src/domain/atomic-write.ts";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), "pi-tmux-session-map-"));
@@ -61,6 +61,21 @@ test("cleanupStaleTempFiles removes only old temp files", async () => {
     assert.equal(result.scanned, 2);
     assert.equal(result.removed, 1);
     assert.deepEqual((await readdir(dir)).sort(), ["status.json", "status.json.tmp-2"]);
+  });
+});
+
+test("cleanupSupersededStatusFiles removes older status files for the same pane id", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(join(dir, "old.json"), JSON.stringify({ pane_id: "%22", state: "working" }));
+    await writeFile(join(dir, "current.json"), JSON.stringify({ pane_id: "%22", state: "done" }));
+    await writeFile(join(dir, "other-pane.json"), JSON.stringify({ pane_id: "%23", state: "working" }));
+    await writeFile(join(dir, "broken.json"), "not json");
+
+    const result = await cleanupSupersededStatusFiles(dir, "current.json", "%22");
+
+    assert.equal(result.scanned, 3);
+    assert.equal(result.removed, 1);
+    assert.deepEqual((await readdir(dir)).sort(), ["broken.json", "current.json", "other-pane.json"]);
   });
 });
 

@@ -69,6 +69,41 @@ export async function cleanupStaleTempFiles(
   return { scanned, removed };
 }
 
+export async function cleanupSupersededStatusFiles(
+  dir: string,
+  currentFileName: string,
+  paneId: string,
+): Promise<CleanupResult> {
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return { scanned: 0, removed: 0 };
+  }
+
+  let scanned = 0;
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.endsWith(".json") || entry === currentFileName) {
+      continue;
+    }
+    scanned += 1;
+    const path = join(dir, entry);
+    try {
+      const payload = JSON.parse(await readFile(path, "utf8"));
+      if (payload?.pane_id !== paneId) {
+        continue;
+      }
+      await rm(path, { force: true });
+      removed += 1;
+    } catch {
+      // Best-effort cleanup only; malformed files are ignored here and skipped
+      // by tws when read.
+    }
+  }
+  return { scanned, removed };
+}
+
 export async function cleanupStaleSessionMappings(
   dir: string,
   maxAgeMs: number,
