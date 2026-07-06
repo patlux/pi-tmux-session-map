@@ -1,6 +1,6 @@
 {
   "name": "pi-tmux-session-map",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Record which Pi session runs in which tmux pane so tmux-resurrect can restore the exact session after a tmux server restart.",
   "type": "module",
   "exports": {
@@ -24,12 +24,14 @@
   },
   "files": [
     "src",
+    "scripts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
+    "check:installed": "npm run check && node scripts/check-installed-cache.mjs",
     "check": "npm run typecheck && npm test && npm pack --dry-run"
   },
   "pi": {

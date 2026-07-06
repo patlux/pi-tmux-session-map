@@ -1,0 +1,103 @@
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+
+import { cleanupStaleSessionMappings, cleanupStaleTempFiles, ensureDirectory, writeAtomic } from "../src/domain/atomic-write.ts";
+
+async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(join(tmpdir(), "pi-tmux-session-map-"));
+  try {
+    return await fn(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("writeAtomic writes final content and cleans temp files", async () => {
+  await withTempDir(async (dir) => {
+    const file = join(dir, "status.json");
+
+    await writeAtomic(file, "one\n", 0o600);
+    await writeAtomic(file, "two\n", 0o600);
+
+    assert.equal(await readFile(file, "utf8"), "two\n");
+    const entries = await readdir(dir);
+    assert.deepEqual(entries, ["status.json"]);
+  });
+});
+
+test("concurrent writeAtomic calls use unique temp files", async () => {
+  await withTempDir(async (dir) => {
+    const file = join(dir, "status.json");
+
+    await Promise.all([
+      writeAtomic(file, "one\n", 0o600),
+      writeAtomic(file, "two\n", 0o600),
+      writeAtomic(file, "three\n", 0o600),
+    ]);
+
+    const finalContent = await readFile(file, "utf8");
+    assert.ok(["one\n", "two\n", "three\n"].includes(finalContent));
+    const entries = await readdir(dir);
+    assert.deepEqual(entries, ["status.json"]);
+  });
+});
+
+test("cleanupStaleTempFiles removes only old temp files", async () => {
+  await withTempDir(async (dir) => {
+    const oldTemp = join(dir, "status.json.tmp-1");
+    const freshTemp = join(dir, "status.json.tmp-2");
+    const normal = join(dir, "status.json");
+    await writeFile(oldTemp, "old");
+    await writeFile(freshTemp, "fresh");
+    await writeFile(normal, "normal");
+    const oldDate = new Date(1000);
+    await utimes(oldTemp, oldDate, oldDate);
+
+    const result = await cleanupStaleTempFiles(dir, 5000, 10000);
+
+    assert.equal(result.scanned, 2);
+    assert.equal(result.removed, 1);
+    assert.deepEqual((await readdir(dir)).sort(), ["status.json", "status.json.tmp-2"]);
+  });
+});
+
+test("cleanupStaleSessionMappings removes only old mappings with missing target session files", async () => {
+  await withTempDir(async (dir) => {
+    const liveTarget = join(dir, "live-session.jsonl");
+    const oldLiveMapping = join(dir, "old-live.session");
+    const oldMissingMapping = join(dir, "old-missing.session");
+    const freshMissingMapping = join(dir, "fresh-missing.session");
+    const status = join(dir, "status.json");
+    await writeFile(liveTarget, "session");
+    await writeFile(oldLiveMapping, `${liveTarget}\n`);
+    await writeFile(oldMissingMapping, `${join(dir, "missing-session.jsonl")}\n`);
+    await writeFile(freshMissingMapping, `${join(dir, "missing-fresh-session.jsonl")}\n`);
+    await writeFile(status, "status");
+    const oldDate = new Date(1000);
+    await utimes(oldLiveMapping, oldDate, oldDate);
+    await utimes(oldMissingMapping, oldDate, oldDate);
+
+    const result = await cleanupStaleSessionMappings(dir, 5000, 10000);
+
+    assert.equal(result.scanned, 3);
+    assert.equal(result.removed, 1);
+    assert.deepEqual((await readdir(dir)).sort(), [
+      "fresh-missing.session",
+      "live-session.jsonl",
+      "old-live.session",
+      "status.json",
+    ]);
+  });
+});
+
+test("ensureDirectory creates nested private directory", async () => {
+  await withTempDir(async (dir) => {
+    const nested = join(dir, "a", "b");
+    await ensureDirectory(nested);
+    await writeFile(join(nested, "ok"), "ok");
+    assert.equal(await readFile(join(nested, "ok"), "utf8"), "ok");
+  });
+});

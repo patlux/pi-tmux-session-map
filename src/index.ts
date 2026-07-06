@@ -1,56 +1,35 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
-import { mkdir, open, rename, utimes, writeFile } from "node:fs/promises";
+import { open, utimes } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import {
-  PANE_KEY_FORMAT,
-  defaultStateDir,
-  mappingFileName,
-  normalizePaneKey,
-  statusFileName,
-} from "./domain/pane-key.ts";
+import { cleanupStaleSessionMappings, cleanupStaleTempFiles, ensureDirectory, writeAtomic } from "./domain/atomic-write.ts";
+import { createAsyncQueue } from "./domain/async-queue.ts";
+import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
+import { PANE_KEY_FORMAT, defaultStateDir, mappingFileName, statusFileName } from "./domain/pane-key.ts";
+import { parsePaneInfoOutput } from "./domain/pane-info.ts";
+import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type RuntimeState, type WorkState } from "./domain/state.ts";
+import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type SessionInfo } from "./domain/status.ts";
 
 const execFileAsync = promisify(execFile);
-const stateDir = defaultStateDir();
-const twsConfigDir = join(homedir(), ".config", "tws");
-const twsStatusDir = join(twsConfigDir, "pi-status");
-const twsTriggerFile = join(twsConfigDir, "agent.trigger");
+const stateDir = process.env.PI_TMUX_SESSION_MAP_STATE_DIR ?? defaultStateDir();
+const twsConfigDir = process.env.PI_TMUX_SESSION_MAP_TWS_CONFIG_DIR ?? join(homedir(), ".config", "tws");
+const twsStatusDir = process.env.PI_TMUX_SESSION_MAP_TWS_STATUS_DIR ?? join(twsConfigDir, "pi-status");
+const twsTriggerFile = process.env.PI_TMUX_SESSION_MAP_TWS_TRIGGER_FILE ?? join(twsConfigDir, "agent.trigger");
+const tmuxBin = process.env.PI_TMUX_SESSION_MAP_TMUX_BIN ?? "tmux";
+const tmuxTimeoutMs = 1000;
+const cleanupMaxAgeMs = 24 * 60 * 60 * 1000;
 const PANE_INFO_FORMAT = `${PANE_KEY_FORMAT}\t#{session_name}\t#{window_index}\t#{pane_index}`;
 
-type WorkState = "idle" | "working" | "done" | "shutdown";
+type StatusAction = WorkState | "refresh" | null;
 
-type PaneInfo = {
-  paneKey: string;
-  paneId: string;
-  sessionName: string;
-  windowIndex: number;
-  paneIndex: number;
+type EventAction = {
+  mapping: boolean;
+  status: StatusAction;
+  cleanup?: boolean;
 };
-
-type TwsStatusPayload = {
-  schema: 1;
-  agent: "pi";
-  pane_id: string;
-  pane_key: string;
-  tmux_session_name: string;
-  window_index: number;
-  pane_index: number;
-  cwd: string;
-  session_file: string | null;
-  session_name: string | null;
-  state: WorkState;
-  updated_at_ms: number;
-  started_at_ms: number | null;
-  finished_at_ms: number | null;
-};
-
-function parseIndex(value: string): number {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
 
 async function resolvePaneInfo(): Promise<PaneInfo | undefined> {
   const pane = process.env.TMUX_PANE;
@@ -58,29 +37,12 @@ async function resolvePaneInfo(): Promise<PaneInfo | undefined> {
     return undefined;
   }
   try {
-    const { stdout } = await execFileAsync("tmux", [
-      "display-message",
-      "-p",
-      "-t",
-      pane,
-      PANE_INFO_FORMAT,
-    ]);
-    const trimmed = stdout.trim();
-    if (trimmed === "") {
-      return undefined;
-    }
-    const [rawPaneKey, sessionName, rawWindowIndex, rawPaneIndex] = trimmed.split("\t");
-    const paneKey = normalizePaneKey(rawPaneKey ?? "");
-    if (!paneKey || !sessionName) {
-      return undefined;
-    }
-    return {
-      paneKey,
-      paneId: pane,
-      sessionName,
-      windowIndex: parseIndex(rawWindowIndex ?? "0"),
-      paneIndex: parseIndex(rawPaneIndex ?? "0"),
-    };
+    const { stdout } = await execFileAsync(
+      tmuxBin,
+      ["display-message", "-p", "-t", pane, PANE_INFO_FORMAT],
+      { timeout: tmuxTimeoutMs },
+    );
+    return parsePaneInfoOutput(stdout, pane);
   } catch {
     return undefined;
   }
@@ -92,7 +54,7 @@ async function touchTwsTrigger(): Promise<void> {
     await utimes(twsTriggerFile, now, now);
   } catch {
     try {
-      const handle = await open(twsTriggerFile, "w");
+      const handle = await open(twsTriggerFile, "w", 0o600);
       await handle.close();
     } catch {
       // Status files are still picked up by tws on its periodic scan.
@@ -100,56 +62,77 @@ async function touchTwsTrigger(): Promise<void> {
   }
 }
 
-async function writeAtomic(file: string, data: string, mode: number): Promise<void> {
-  const tmp = `${file}.tmp-${process.pid}`;
-  await writeFile(tmp, data, { mode });
-  await rename(tmp, file);
+async function writeSessionMapping(info: PaneInfo, sessionFile: string): Promise<void> {
+  await ensureDirectory(stateDir);
+  await writeAtomic(join(stateDir, mappingFileName(info.paneKey)), `${sessionFile}\n`, 0o600);
 }
 
-async function writeSessionMapping(info: PaneInfo, sessionFile: string): Promise<void> {
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  await writeFile(join(stateDir, mappingFileName(info.paneKey)), sessionFile + "\n", {
-    mode: 0o600,
-  });
+function getSessionInfo(ctx: ExtensionContext): SessionInfo {
+  return {
+    cwd: ctx.cwd,
+    sessionFile: ctx.sessionManager.getSessionFile() ?? null,
+    sessionName: ctx.sessionManager.getSessionName() ?? null,
+  };
 }
 
 async function writeTwsStatus(
   info: PaneInfo,
-  ctx: ExtensionContext,
+  session: SessionInfo,
   state: WorkState,
+  updatedAtMs: number,
   startedAtMs: number | null,
+  finishedAtMs: number | null,
 ): Promise<void> {
-  const now = Date.now();
-  const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
-  const payload: TwsStatusPayload = {
-    schema: 1,
-    agent: "pi",
-    pane_id: info.paneId,
-    pane_key: info.paneKey,
-    tmux_session_name: info.sessionName,
-    window_index: info.windowIndex,
-    pane_index: info.paneIndex,
-    cwd: ctx.cwd,
-    session_file: sessionFile,
-    session_name: ctx.sessionManager.getSessionName() ?? null,
-    state,
-    updated_at_ms: now,
-    started_at_ms: startedAtMs,
-    finished_at_ms: state === "done" ? now : null,
-  };
+  const payload = buildTwsStatusPayload(info, session, state, updatedAtMs, startedAtMs, finishedAtMs);
 
-  await mkdir(twsStatusDir, { recursive: true, mode: 0o700 });
-  await writeAtomic(
-    join(twsStatusDir, statusFileName(info.paneKey)),
-    `${JSON.stringify(payload)}\n`,
-    0o600,
-  );
+  await ensureDirectory(twsStatusDir);
+  await writeAtomic(join(twsStatusDir, statusFileName(info.paneKey)), serializeStatusPayload(payload), 0o600);
   await touchTwsTrigger();
 }
 
-function reportError(prefix: string, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`${prefix}: ${message}`);
+async function cleanupStaleFiles(): Promise<void> {
+  await cleanupStaleTempFiles(stateDir, cleanupMaxAgeMs);
+  await cleanupStaleTempFiles(twsStatusDir, cleanupMaxAgeMs);
+  await cleanupStaleSessionMappings(stateDir, 30 * cleanupMaxAgeMs);
+}
+
+async function applyEventAction(
+  ctx: ExtensionContext,
+  action: EventAction,
+  runtimeState: RuntimeState,
+): Promise<RuntimeState> {
+  const session = getSessionInfo(ctx);
+  const mappingSessionFile = action.mapping ? session.sessionFile : null;
+  if (mappingSessionFile === null && action.status === null) {
+    return runtimeState;
+  }
+
+  const info = await resolvePaneInfo();
+  if (!info) {
+    return runtimeState;
+  }
+
+  if (mappingSessionFile !== null) {
+    await writeSessionMapping(info, mappingSessionFile);
+  }
+
+  if (action.status === null) {
+    return runtimeState;
+  }
+
+  const now = Date.now();
+  const transition =
+    action.status === "refresh"
+      ? refreshStatusTransition(runtimeState, now)
+      : action.status === runtimeState.lastState
+        ? refreshStatusTransition(runtimeState, now)
+        : nextStatusTransition(runtimeState, action.status, now);
+  if (!transition.shouldWrite) {
+    return transition;
+  }
+
+  await writeTwsStatus(info, session, transition.state, now, transition.startedAtMs, transition.finishedAtMs);
+  return transition;
 }
 
 /**
@@ -162,66 +145,39 @@ function reportError(prefix: string, error: unknown): void {
  * a spinner while Pi is working and a checkmark when it finishes.
  */
 export default function tmuxSessionMap(pi: ExtensionAPI) {
-  let startedAtMs: number | null = null;
-  let lastState: WorkState | null = null;
+  const queue = createAsyncQueue();
+  const errorReporter = createThrottledErrorReporter();
+  let runtimeState = createRuntimeState();
 
-  const updateMapping = async (ctx: ExtensionContext) => {
-    const sessionFile = ctx.sessionManager.getSessionFile();
-    if (!sessionFile) {
-      return;
-    }
-    const info = await resolvePaneInfo();
-    if (!info) {
-      return;
-    }
-    try {
-      await writeSessionMapping(info, sessionFile);
-    } catch (error) {
-      reportError("pi-tmux-session-map: failed to write session mapping", error);
-    }
-  };
-
-  const updateStatus = async (ctx: ExtensionContext, state: WorkState) => {
-    // Never downgrade a finished marker to "shutdown": quitting Pi right after
-    // it finished should keep the ✓ visible in tws.
-    if (state === "shutdown" && lastState === "done") {
-      return;
-    }
-
-    const info = await resolvePaneInfo();
-    if (!info) {
-      return;
-    }
-    try {
-      const currentStartedAtMs = state === "working" ? Date.now() : startedAtMs;
-      await writeTwsStatus(info, ctx, state, currentStartedAtMs);
-      startedAtMs = state === "working" ? currentStartedAtMs : null;
-      lastState = state;
-    } catch (error) {
-      reportError("pi-tmux-session-map: failed to write tws status", error);
-    }
+  const enqueue = async (ctx: ExtensionContext, action: EventAction) => {
+    await queue.enqueue(async () => {
+      try {
+        if (action.cleanup === true) {
+          await cleanupStaleFiles();
+        }
+        runtimeState = await applyEventAction(ctx, action, runtimeState);
+      } catch (error) {
+        errorReporter.report("pi-tmux-session-map: failed to update sidecars", error);
+      }
+    });
   };
 
   // Intentionally no cleanup on session_shutdown: the mapping must survive a
   // tmux server restart so resurrect can restore the exact session.
   pi.on("session_start", async (_event, ctx) => {
-    await updateMapping(ctx);
-    await updateStatus(ctx, "idle");
+    await enqueue(ctx, { mapping: true, status: "idle", cleanup: true });
   });
   pi.on("session_info_changed", async (_event, ctx) => {
-    await updateMapping(ctx);
-    await updateStatus(ctx, lastState ?? "idle");
+    await enqueue(ctx, { mapping: true, status: "refresh" });
   });
   pi.on("agent_start", async (_event, ctx) => {
-    await updateMapping(ctx);
-    await updateStatus(ctx, "working");
+    await enqueue(ctx, { mapping: true, status: "working" });
   });
   // Covers sessions whose file only exists after the first agent turn.
   pi.on("agent_end", async (_event, ctx) => {
-    await updateMapping(ctx);
-    await updateStatus(ctx, "done");
+    await enqueue(ctx, { mapping: true, status: "done" });
   });
   pi.on("session_shutdown", async (_event, ctx) => {
-    await updateStatus(ctx, "shutdown");
+    await enqueue(ctx, { mapping: false, status: "shutdown" });
   });
 }
