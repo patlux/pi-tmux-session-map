@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic } from "../src/domain/atomic-write.ts";
+import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededSessionMappings, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic } from "../src/domain/atomic-write.ts";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), "pi-tmux-session-map-"));
@@ -76,6 +76,27 @@ test("cleanupSupersededStatusFiles removes older status files for the same pane 
     assert.equal(result.scanned, 3);
     assert.equal(result.removed, 1);
     assert.deepEqual((await readdir(dir)).sort(), ["broken.json", "current.json", "other-pane.json"]);
+  });
+});
+
+test("cleanupSupersededSessionMappings removes other mappings pointing at the same session file", async () => {
+  await withTempDir(async (dir) => {
+    const target = join(dir, "session-019f272f.jsonl");
+    // Same live session reached under an old key name and a legacy filename.
+    await writeFile(join(dir, "tws_a_progress_1.0-hash.session"), `${target}\n`);
+    await writeFile(join(dir, "tws_a_notification_1.0.session"), `${target}\n`);
+    await writeFile(join(dir, "tws_a_notification_1.0-old.session"), `${target}\n`);
+    // Unrelated session must survive.
+    await writeFile(join(dir, "tws_b_other_1.0-hash.session"), `${join(dir, "other.jsonl")}\n`);
+
+    const result = await cleanupSupersededSessionMappings(dir, "tws_a_progress_1.0-hash.session", target);
+
+    assert.equal(result.scanned, 3);
+    assert.equal(result.removed, 2);
+    assert.deepEqual((await readdir(dir)).sort(), [
+      "tws_a_progress_1.0-hash.session",
+      "tws_b_other_1.0-hash.session",
+    ]);
   });
 });
 

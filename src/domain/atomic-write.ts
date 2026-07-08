@@ -104,6 +104,43 @@ export async function cleanupSupersededStatusFiles(
   return { scanned, removed };
 }
 
+export async function cleanupSupersededSessionMappings(
+  dir: string,
+  currentFileName: string,
+  sessionFile: string,
+): Promise<CleanupResult> {
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return { scanned: 0, removed: 0 };
+  }
+
+  let scanned = 0;
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.endsWith(".session") || entry === currentFileName) {
+      continue;
+    }
+    scanned += 1;
+    const path = join(dir, entry);
+    try {
+      // A Pi session file is owned by exactly one live pane, so any other
+      // mapping pointing at it is a stale key (window renamed / pane moved) or
+      // a legacy-named duplicate of the current key.
+      const target = (await readFile(path, "utf8")).split(/\r?\n/, 1)[0]?.trim() ?? "";
+      if (target !== sessionFile) {
+        continue;
+      }
+      await rm(path, { force: true });
+      removed += 1;
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
+  return { scanned, removed };
+}
+
 export async function cleanupStaleSessionMappings(
   dir: string,
   maxAgeMs: number,
