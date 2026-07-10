@@ -1,4 +1,18 @@
-export type WorkState = "idle" | "working" | "done" | "shutdown";
+export type WorkState =
+  | "idle"
+  | "working"
+  | "retrying"
+  | "done"
+  | "cancelled"
+  | "incomplete"
+  | "failed"
+  | "shutdown";
+
+export type FinalWorkState = "done" | "cancelled" | "incomplete" | "failed";
+
+function isFinalWorkState(state: WorkState | null): state is FinalWorkState {
+  return state === "done" || state === "cancelled" || state === "incomplete" || state === "failed";
+}
 
 export type RuntimeState = {
   startedAtMs: number | null;
@@ -28,7 +42,7 @@ export function nextStatusTransition(
 ): StatusTransition {
   const sequence = current.sequence + 1;
 
-  if (state === "shutdown" && current.lastState === "done") {
+  if (state === "shutdown" && isFinalWorkState(current.lastState)) {
     return {
       ...current,
       sequence,
@@ -48,11 +62,22 @@ export function nextStatusTransition(
     };
   }
 
-  if (state === "done") {
+  if (state === "retrying") {
+    return {
+      startedAtMs: current.startedAtMs ?? nowMs,
+      finishedAtMs: null,
+      lastState: "retrying",
+      sequence,
+      state,
+      shouldWrite: true,
+    };
+  }
+
+  if (isFinalWorkState(state)) {
     return {
       startedAtMs: current.startedAtMs,
       finishedAtMs: current.finishedAtMs ?? nowMs,
-      lastState: "done",
+      lastState: state,
       sequence,
       state,
       shouldWrite: true,
@@ -80,8 +105,8 @@ export function refreshStatusTransition(current: RuntimeState, nowMs: number): S
     return nextStatusTransition(current, "working", nowMs);
   }
 
-  if (state === "done" && current.finishedAtMs === null) {
-    return nextStatusTransition(current, "done", nowMs);
+  if (isFinalWorkState(state) && current.finishedAtMs === null) {
+    return nextStatusTransition(current, state, nowMs);
   }
 
   return {

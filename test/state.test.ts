@@ -26,14 +26,38 @@ test("done preserves start time and records first finish time", () => {
   assert.equal(repeatedDone.finishedAtMs, 2000);
 });
 
-test("shutdown after done advances state sequence but does not write", () => {
+test("retrying preserves the run start and remains unfinished", () => {
   const working = nextStatusTransition(createRuntimeState(), "working", 1000);
-  const done = nextStatusTransition(working, "done", 2000);
-  const shutdown = nextStatusTransition(done, "shutdown", 3000);
+  const retrying = nextStatusTransition(working, "retrying", 2000);
 
-  assert.equal(shutdown.shouldWrite, false);
-  assert.equal(shutdown.lastState, "done");
-  assert.equal(shutdown.sequence, 3);
+  assert.equal(retrying.shouldWrite, true);
+  assert.equal(retrying.lastState, "retrying");
+  assert.equal(retrying.startedAtMs, 1000);
+  assert.equal(retrying.finishedAtMs, null);
+});
+
+test("terminal outcomes preserve start time and record finish time", () => {
+  for (const finalState of ["done", "cancelled", "incomplete", "failed"] as const) {
+    const working = nextStatusTransition(createRuntimeState(), "working", 1000);
+    const finished = nextStatusTransition(working, finalState, 2000);
+
+    assert.equal(finished.shouldWrite, true);
+    assert.equal(finished.lastState, finalState);
+    assert.equal(finished.startedAtMs, 1000);
+    assert.equal(finished.finishedAtMs, 2000);
+  }
+});
+
+test("shutdown after terminal state advances sequence but does not overwrite it", () => {
+  for (const finalState of ["done", "cancelled", "incomplete", "failed"] as const) {
+    const working = nextStatusTransition(createRuntimeState(), "working", 1000);
+    const finished = nextStatusTransition(working, finalState, 2000);
+    const shutdown = nextStatusTransition(finished, "shutdown", 3000);
+
+    assert.equal(shutdown.shouldWrite, false);
+    assert.equal(shutdown.lastState, finalState);
+    assert.equal(shutdown.sequence, 3);
+  }
 });
 
 test("idle resets run timestamps", () => {
@@ -58,14 +82,16 @@ test("refreshStatusTransition preserves current working start time", () => {
   assert.equal(refresh.sequence, 2);
 });
 
-test("refreshStatusTransition preserves current done finish time", () => {
-  const working = nextStatusTransition(createRuntimeState(), "working", 1000);
-  const done = nextStatusTransition(working, "done", 2000);
-  const refresh = refreshStatusTransition(done, 3000);
+test("refreshStatusTransition preserves terminal finish time", () => {
+  for (const finalState of ["done", "cancelled", "incomplete", "failed"] as const) {
+    const working = nextStatusTransition(createRuntimeState(), "working", 1000);
+    const finished = nextStatusTransition(working, finalState, 2000);
+    const refresh = refreshStatusTransition(finished, 3000);
 
-  assert.equal(refresh.shouldWrite, true);
-  assert.equal(refresh.lastState, "done");
-  assert.equal(refresh.startedAtMs, 1000);
-  assert.equal(refresh.finishedAtMs, 2000);
-  assert.equal(refresh.sequence, 3);
+    assert.equal(refresh.shouldWrite, true);
+    assert.equal(refresh.lastState, finalState);
+    assert.equal(refresh.startedAtMs, 1000);
+    assert.equal(refresh.finishedAtMs, 2000);
+    assert.equal(refresh.sequence, 3);
+  }
 });

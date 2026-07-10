@@ -10,7 +10,7 @@ import { createAsyncQueue } from "./domain/async-queue.ts";
 import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
 import { PANE_KEY_FORMAT, defaultStateDir, mappingFileName, statusFileName } from "./domain/pane-key.ts";
 import { parsePaneInfoOutput } from "./domain/pane-info.ts";
-import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type RuntimeState, type WorkState } from "./domain/state.ts";
+import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
 import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type SessionInfo } from "./domain/status.ts";
 
 const execFileAsync = promisify(execFile);
@@ -30,6 +30,35 @@ type EventAction = {
   status: StatusAction;
   cleanup?: boolean;
 };
+
+type AgentEndMessage = {
+  role: string;
+  stopReason?: string;
+};
+
+export function finalWorkStateForMessages(messages: readonly AgentEndMessage[]): FinalWorkState {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant") {
+      continue;
+    }
+    switch (message.stopReason) {
+      case "error":
+        return "failed";
+      case "aborted":
+        return "cancelled";
+      case "length":
+        return "incomplete";
+      default:
+        return "done";
+    }
+  }
+  return "done";
+}
+
+export function provisionalWorkState(finalState: FinalWorkState): WorkState {
+  return finalState === "failed" ? "retrying" : finalState;
+}
 
 async function resolvePaneInfo(): Promise<PaneInfo | undefined> {
   const pane = process.env.TMUX_PANE;
@@ -146,12 +175,14 @@ async function applyEventAction(
  * of the pane's working directory.
  *
  * Also writes tws-compatible Pi work-status sidecar JSON files so tws can show
- * a spinner while Pi is working and a checkmark when it finishes.
+ * active/retrying state and distinguish successful, cancelled, incomplete, and
+ * failed outcomes.
  */
 export default function tmuxSessionMap(pi: ExtensionAPI) {
   const queue = createAsyncQueue();
   const errorReporter = createThrottledErrorReporter();
   let runtimeState = createRuntimeState();
+  let pendingFinalState: FinalWorkState = "done";
 
   const enqueue = async (ctx: ExtensionContext, action: EventAction) => {
     await queue.enqueue(async () => {
@@ -175,11 +206,23 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     await enqueue(ctx, { mapping: true, status: "refresh" });
   });
   pi.on("agent_start", async (_event, ctx) => {
+    pendingFinalState = "done";
     await enqueue(ctx, { mapping: true, status: "working" });
   });
-  // Covers sessions whose file only exists after the first agent turn.
-  pi.on("agent_end", async (_event, ctx) => {
-    await enqueue(ctx, { mapping: true, status: "done" });
+  // agent_end may be followed by automatic retry/compaction. Keep failures
+  // provisional until agent_settled confirms that no continuation will run.
+  pi.on("agent_end", async (event, ctx) => {
+    pendingFinalState = finalWorkStateForMessages(event.messages);
+    await enqueue(ctx, {
+      mapping: true,
+      // Technical errors may still recover through Pi's automatic retry or
+      // compaction flow. User aborts and token-limit responses are already
+      // definitive and should not briefly look like retries.
+      status: provisionalWorkState(pendingFinalState),
+    });
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    await enqueue(ctx, { mapping: true, status: pendingFinalState });
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     await enqueue(ctx, { mapping: false, status: "shutdown" });

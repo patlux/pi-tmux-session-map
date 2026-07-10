@@ -2,7 +2,7 @@
 
 A [pi](https://pi.dev) extension that records which Pi session runs in which tmux pane, so tmux-resurrect can restore the **exact** session after a tmux server restart — instead of blindly continuing the newest session for the pane's working directory.
 
-It also writes [tws](https://github.com/ytaskiran/tws)-compatible Pi work-status sidecar files so tws can show a live spinner while Pi is working and a checkmark after Pi finishes.
+It also writes [tws](https://github.com/ytaskiran/tws)-compatible Pi work-status sidecar files so tws can distinguish working, retrying, successful, cancelled, incomplete, and failed Pi runs.
 
 ## Problem
 
@@ -27,11 +27,13 @@ It writes two sidecars:
 
 The `.session` file contains the active Pi session file path. It is written on `session_start`, `session_info_changed`, `agent_start`, and `agent_end` when the current Pi session has a backing session file.
 
-The `.json` file contains tws work state (`idle`, `working`, `done`, `shutdown`) plus pane/session metadata and is written on Pi lifecycle events. The extension touches `~/.config/tws/agent.trigger` after status writes so tws refreshes within one poll tick.
+The `.json` file contains tws work state (`idle`, `working`, `retrying`, `done`, `cancelled`, `incomplete`, `failed`, `shutdown`) plus pane/session metadata and is written on Pi lifecycle events. A technical-error `agent_end` is provisional `retrying`; aborts and token-limit responses become `cancelled`/`incomplete` immediately. `agent_settled` confirms the final outcome (`failed` if recovery did not succeed). The extension touches `~/.config/tws/agent.trigger` after status writes so tws refreshes within one poll tick.
 
 Mappings are intentionally **not** removed on shutdown — they must survive `tmux kill-server` so resurrect can use them. Every Pi start in a pane overwrites that pane's mapping, so stale entries self-heal. Very old mapping files and interrupted atomic-write temp files are cleaned up opportunistically on session start.
 
 ## Install
+
+Requires Pi `0.80.5` or newer (`agent_settled` lifecycle event).
 
 ```sh
 pi install git:github.com/patlux/pi-tmux-session-map
@@ -97,7 +99,7 @@ The session mapping is written only when:
 - Pi runs inside tmux (`$TMUX` and `$TMUX_PANE` set)
 - the current session has a backing session file (not `--no-session`)
 
-The tws status file is written for any Pi session inside tmux, even when the session file is not available yet; `session_file` is `null` until Pi creates one.
+The tws status file is written for any Pi session inside tmux, even when the session file is not available yet; `session_file` is `null` until Pi creates one. Final failure-like outcomes are delayed until `agent_settled`, so automatic retries or compaction recovery do not appear as permanent failures.
 
 If the recorded session file no longer exists, the wrapper falls back to `pi --continue` for the pane's working directory.
 
