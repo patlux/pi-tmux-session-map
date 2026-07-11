@@ -1,7 +1,7 @@
 {
   "name": "pi-tmux-session-map",
   "version": "0.2.0",
-  "description": "Record which Pi session runs in which tmux pane so tmux-resurrect can restore the exact session after a tmux server restart.",
+  "description": "Map Pi sessions to tmux panes and publish TWS work status for tmux and Zellij.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -11,6 +11,8 @@
     "pi-extension",
     "pi",
     "tmux",
+    "zellij",
+    "tws",
     "tmux-resurrect"
   ],
   "license": "MIT",

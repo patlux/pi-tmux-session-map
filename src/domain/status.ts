@@ -1,6 +1,7 @@
 import type { WorkState } from "./state.ts";
 
 export type PaneInfo = {
+  backend: "tmux" | "zellij";
   paneKey: string;
   paneId: string;
   sessionName: string;
@@ -17,6 +18,7 @@ export type SessionInfo = {
 export type TwsStatusPayload = {
   schema: 1;
   agent: "pi";
+  backend: "tmux" | "zellij";
   pane_id: string;
   pane_key: string;
   tmux_session_name: string;
@@ -42,6 +44,7 @@ export function buildTwsStatusPayload(
   return {
     schema: 1,
     agent: "pi",
+    backend: pane.backend,
     pane_id: pane.paneId,
     pane_key: pane.paneKey,
     tmux_session_name: pane.sessionName,

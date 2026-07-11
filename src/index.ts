@@ -9,7 +9,7 @@ import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededSe
 import { createAsyncQueue } from "./domain/async-queue.ts";
 import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
 import { PANE_KEY_FORMAT, defaultStateDir, mappingFileName, statusFileName } from "./domain/pane-key.ts";
-import { parsePaneInfoOutput } from "./domain/pane-info.ts";
+import { parsePaneInfoOutput, parseZellijPaneInfo } from "./domain/pane-info.ts";
 import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
 import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type SessionInfo } from "./domain/status.ts";
 
@@ -19,7 +19,8 @@ const twsConfigDir = process.env.PI_TMUX_SESSION_MAP_TWS_CONFIG_DIR ?? join(home
 const twsStatusDir = process.env.PI_TMUX_SESSION_MAP_TWS_STATUS_DIR ?? join(twsConfigDir, "pi-status");
 const twsTriggerFile = process.env.PI_TMUX_SESSION_MAP_TWS_TRIGGER_FILE ?? join(twsConfigDir, "agent.trigger");
 const tmuxBin = process.env.PI_TMUX_SESSION_MAP_TMUX_BIN ?? "tmux";
-const tmuxTimeoutMs = 1000;
+const zellijBin = process.env.PI_TMUX_SESSION_MAP_ZELLIJ_BIN ?? "zellij";
+const muxTimeoutMs = 1000;
 const cleanupMaxAgeMs = 24 * 60 * 60 * 1000;
 const PANE_INFO_FORMAT = `${PANE_KEY_FORMAT}\t#{session_name}\t#{window_index}\t#{pane_index}`;
 
@@ -61,29 +62,45 @@ export function provisionalWorkState(finalState: FinalWorkState): WorkState {
 }
 
 async function resolvePaneInfo(): Promise<PaneInfo | undefined> {
-  const pane = process.env.TMUX_PANE;
-  if (!process.env.TMUX || !pane) {
-    return undefined;
+  const tmuxPane = process.env.TMUX_PANE;
+  if (process.env.TMUX && tmuxPane) {
+    try {
+      const { stdout } = await execFileAsync(
+        tmuxBin,
+        ["display-message", "-p", "-t", tmuxPane, PANE_INFO_FORMAT],
+        { timeout: muxTimeoutMs },
+      );
+      return parsePaneInfoOutput(stdout, tmuxPane);
+    } catch {
+      return undefined;
+    }
   }
-  try {
-    const { stdout } = await execFileAsync(
-      tmuxBin,
-      ["display-message", "-p", "-t", pane, PANE_INFO_FORMAT],
-      { timeout: tmuxTimeoutMs },
-    );
-    return parsePaneInfoOutput(stdout, pane);
-  } catch {
-    return undefined;
+
+  const zellijSession = process.env.ZELLIJ_SESSION_NAME;
+  const zellijPane = process.env.ZELLIJ_PANE_ID;
+  if (process.env.ZELLIJ && zellijSession && zellijPane) {
+    try {
+      const { stdout } = await execFileAsync(
+        zellijBin,
+        ["--session", zellijSession, "action", "list-panes", "--json", "--all"],
+        { timeout: muxTimeoutMs },
+      );
+      return parseZellijPaneInfo(stdout, zellijSession, zellijPane);
+    } catch {
+      return undefined;
+    }
   }
+
+  return undefined;
 }
 
-async function touchTwsTrigger(): Promise<void> {
+async function touchTwsTrigger(path = twsTriggerFile): Promise<void> {
   const now = new Date();
   try {
-    await utimes(twsTriggerFile, now, now);
+    await utimes(path, now, now);
   } catch {
     try {
-      const handle = await open(twsTriggerFile, "w", 0o600);
+      const handle = await open(path, "w", 0o600);
       await handle.close();
     } catch {
       // Status files are still picked up by tws on its periodic scan.
@@ -106,6 +123,22 @@ function getSessionInfo(ctx: ExtensionContext): SessionInfo {
   };
 }
 
+function statusDirectory(info: PaneInfo): string {
+  if (info.backend === "zellij") {
+    return process.env.PI_TMUX_SESSION_MAP_ZELLIJ_STATUS_DIR
+      ?? join(homedir(), ".config", "tws-zellij", "pi-status");
+  }
+  return twsStatusDir;
+}
+
+function triggerFile(info: PaneInfo): string {
+  if (info.backend === "zellij") {
+    return process.env.PI_TMUX_SESSION_MAP_ZELLIJ_TRIGGER_FILE
+      ?? join(homedir(), ".config", "tws-zellij", "agent.trigger");
+  }
+  return twsTriggerFile;
+}
+
 async function writeTwsStatus(
   info: PaneInfo,
   session: SessionInfo,
@@ -116,16 +149,21 @@ async function writeTwsStatus(
 ): Promise<void> {
   const payload = buildTwsStatusPayload(info, session, state, updatedAtMs, startedAtMs, finishedAtMs);
 
+  const directory = statusDirectory(info);
   const fileName = statusFileName(info.paneKey);
-  await ensureDirectory(twsStatusDir);
-  await writeAtomic(join(twsStatusDir, fileName), serializeStatusPayload(payload), 0o600);
-  await cleanupSupersededStatusFiles(twsStatusDir, fileName, info.paneId);
-  await touchTwsTrigger();
+  await ensureDirectory(directory);
+  await writeAtomic(join(directory, fileName), serializeStatusPayload(payload), 0o600);
+  await cleanupSupersededStatusFiles(directory, fileName, info.paneId);
+
+  await touchTwsTrigger(triggerFile(info));
 }
 
 async function cleanupStaleFiles(): Promise<void> {
+  const zellijStatusDir = process.env.PI_TMUX_SESSION_MAP_ZELLIJ_STATUS_DIR
+    ?? join(homedir(), ".config", "tws-zellij", "pi-status");
   await cleanupStaleTempFiles(stateDir, cleanupMaxAgeMs);
   await cleanupStaleTempFiles(twsStatusDir, cleanupMaxAgeMs);
+  await cleanupStaleTempFiles(zellijStatusDir, cleanupMaxAgeMs);
   await cleanupStaleSessionMappings(stateDir, 30 * cleanupMaxAgeMs);
 }
 
@@ -145,7 +183,7 @@ async function applyEventAction(
     return runtimeState;
   }
 
-  if (mappingSessionFile !== null) {
+  if (mappingSessionFile !== null && info.backend === "tmux") {
     await writeSessionMapping(info, mappingSessionFile);
   }
 

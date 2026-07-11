@@ -2,7 +2,7 @@
 
 A [pi](https://pi.dev) extension that records which Pi session runs in which tmux pane, so tmux-resurrect can restore the **exact** session after a tmux server restart — instead of blindly continuing the newest session for the pane's working directory.
 
-It also writes [tws](https://github.com/ytaskiran/tws)-compatible Pi work-status sidecar files so tws can distinguish working, retrying, successful, cancelled, incomplete, and failed Pi runs.
+It also writes [tws](https://github.com/ytaskiran/tws)-compatible Pi work-status sidecar files for both tmux and Zellij, so each TWS edition can distinguish working, retrying, successful, cancelled, incomplete, and failed Pi runs.
 
 ## Problem
 
@@ -18,16 +18,17 @@ The extension resolves a stable tmux pane key:
 
 That key is stable across tmux server restarts (unlike pane ids like `%42`), which is exactly what tmux-resurrect restores. File names use a readable sanitized prefix plus a 12-character SHA-256 suffix so different pane keys cannot collide and very long tmux session names stay below filesystem filename limits.
 
-It writes two sidecars:
+For tmux it writes the exact-resume mapping and status sidecar. For Zellij it writes only the status sidecar because Zellij owns session resurrection itself:
 
 ```text
 ~/.local/state/pi/tmux-sessions/<sanitized-pane-key>-<sha256-12>.session
 ~/.config/tws/pi-status/<sanitized-pane-key>-<sha256-12>.json
+~/.config/tws-zellij/pi-status/<sanitized-pane-key>-<sha256-12>.json
 ```
 
 The `.session` file contains the active Pi session file path. It is written on `session_start`, `session_info_changed`, `agent_start`, and `agent_end` when the current Pi session has a backing session file.
 
-The `.json` file contains tws work state (`idle`, `working`, `retrying`, `done`, `cancelled`, `incomplete`, `failed`, `shutdown`) plus pane/session metadata and is written on Pi lifecycle events. A technical-error `agent_end` is provisional `retrying`; aborts and token-limit responses become `cancelled`/`incomplete` immediately. `agent_settled` confirms the final outcome (`failed` if recovery did not succeed). The extension touches `~/.config/tws/agent.trigger` after status writes so tws refreshes within one poll tick.
+The `.json` file contains the multiplexer backend, tws work state (`idle`, `working`, `retrying`, `done`, `cancelled`, `incomplete`, `failed`, `shutdown`), and pane/session metadata. A technical-error `agent_end` is provisional `retrying`; aborts and token-limit responses become `cancelled`/`incomplete` immediately. `agent_settled` confirms the final outcome (`failed` if recovery did not succeed). The extension touches the matching `agent.trigger` file after status writes so that edition refreshes within one poll tick.
 
 Mappings are intentionally **not** removed on shutdown — they must survive `tmux kill-server` so resurrect can use them. Every Pi start in a pane overwrites that pane's mapping, so stale entries self-heal. Very old mapping files and interrupted atomic-write temp files are cleaned up opportunistically on session start.
 
@@ -94,12 +95,7 @@ set -g @resurrect-processes '"~pi-coding-agent/dist/cli.js->pi-tmux-resume"'
 
 ## Behavior
 
-The session mapping is written only when:
-
-- Pi runs inside tmux (`$TMUX` and `$TMUX_PANE` set)
-- the current session has a backing session file (not `--no-session`)
-
-The tws status file is written for any Pi session inside tmux, even when the session file is not available yet; `session_file` is `null` until Pi creates one. Final failure-like outcomes are delayed until `agent_settled`, so automatic retries or compaction recovery do not appear as permanent failures.
+The exact session mapping is written only when Pi runs inside tmux (`$TMUX` and `$TMUX_PANE` set) and the current session has a backing session file. The tws status file is written inside either tmux or Zellij (`$ZELLIJ`, `$ZELLIJ_SESSION_NAME`, and `$ZELLIJ_PANE_ID`), even when the Pi session file is not available yet; `session_file` is `null` until Pi creates one. Final failure-like outcomes are delayed until `agent_settled`, so automatic retries or compaction recovery do not appear as permanent failures.
 
 If the recorded session file no longer exists, the wrapper falls back to `pi --continue` for the pane's working directory.
 
@@ -120,5 +116,8 @@ Optional environment variables for hardening or local integration:
 - `PI_TMUX_SESSION_MAP_TWS_STATUS_DIR` — override only the tws status directory.
 - `PI_TMUX_SESSION_MAP_TWS_TRIGGER_FILE` — override the tws trigger file.
 - `PI_TMUX_SESSION_MAP_TMUX_BIN` — override the `tmux` binary path.
+- `PI_TMUX_SESSION_MAP_ZELLIJ_BIN` — override the `zellij` binary path.
+- `PI_TMUX_SESSION_MAP_ZELLIJ_STATUS_DIR` — override the Zellij TWS status directory.
+- `PI_TMUX_SESSION_MAP_ZELLIJ_TRIGGER_FILE` — override the Zellij TWS trigger file.
 
 Lifecycle sidecar updates are serialized in-process, mapping and status files are written atomically, and `tmux display-message` is bounded by a short timeout so Pi lifecycle hooks do not hang indefinitely.

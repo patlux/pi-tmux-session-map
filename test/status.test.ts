@@ -6,6 +6,7 @@ import { buildTwsStatusPayload, serializeStatusPayload } from "../src/domain/sta
 test("buildTwsStatusPayload maps pane and session metadata", () => {
   const payload = buildTwsStatusPayload(
     {
+      backend: "tmux",
       paneKey: "tws_proj:1.0",
       paneId: "%42",
       sessionName: "tws_proj",
@@ -26,6 +27,7 @@ test("buildTwsStatusPayload maps pane and session metadata", () => {
   assert.deepEqual(payload, {
     schema: 1,
     agent: "pi",
+    backend: "tmux",
     pane_id: "%42",
     pane_key: "tws_proj:1.0",
     tmux_session_name: "tws_proj",
@@ -44,6 +46,7 @@ test("buildTwsStatusPayload maps pane and session metadata", () => {
 test("serializeStatusPayload emits newline-terminated JSON", () => {
   const payload = buildTwsStatusPayload(
     {
+      backend: "tmux",
       paneKey: "tws_proj:1.0",
       paneId: "%42",
       sessionName: "tws_proj",
