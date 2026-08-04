@@ -83,7 +83,7 @@ test("cleanupSupersededSessionMappings removes other mappings pointing at the sa
   await withTempDir(async (dir) => {
     const target = join(dir, "session-019f272f.jsonl");
     // Same live session reached under an old key name and a legacy filename.
-    await writeFile(join(dir, "tws_a_progress_1.0-hash.session"), `${target}\n`);
+    await writeFile(join(dir, "tws_a_progress_1.0-hash.session"), `${JSON.stringify({ schema: 2, paneKey: "a:1.0", sessionFile: target, sessionId: "id", cwd: dir, sessionName: null, updatedAtMs: 1 })}\n`);
     await writeFile(join(dir, "tws_a_notification_1.0.session"), `${target}\n`);
     await writeFile(join(dir, "tws_a_notification_1.0-old.session"), `${target}\n`);
     // Unrelated session must survive.
@@ -108,7 +108,7 @@ test("cleanupStaleSessionMappings removes only old mappings with missing target 
     const freshMissingMapping = join(dir, "fresh-missing.session");
     const status = join(dir, "status.json");
     await writeFile(liveTarget, "session");
-    await writeFile(oldLiveMapping, `${liveTarget}\n`);
+    await writeFile(oldLiveMapping, `${JSON.stringify({ schema: 2, paneKey: "live:1.0", sessionFile: liveTarget, sessionId: "id", cwd: dir, sessionName: null, updatedAtMs: 1 })}\n`);
     await writeFile(oldMissingMapping, `${join(dir, "missing-session.jsonl")}\n`);
     await writeFile(freshMissingMapping, `${join(dir, "missing-fresh-session.jsonl")}\n`);
     await writeFile(status, "status");

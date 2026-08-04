@@ -3,17 +3,28 @@ import { execFile } from "node:child_process";
 import { open, utimes } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededSessionMappings, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic } from "./domain/atomic-write.ts";
 import { createAsyncQueue } from "./domain/async-queue.ts";
 import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
 import { PANE_KEY_FORMAT, defaultStateDir, mappingFileName, statusFileName } from "./domain/pane-key.ts";
-import { parsePaneInfoOutput, parseZellijPaneInfo } from "./domain/pane-info.ts";
+import { parsePaneInfoOutput, parseZellijPaneInfo, mexPaneInfo } from "./domain/pane-info.ts";
+import { buildRestoreAck, restoreAckPath, restoreExpectationFromEnvironment, serializeRestoreAck } from "./domain/restore-ack.ts";
+import { buildSessionMapping, serializeSessionMapping } from "./domain/session-mapping.ts";
 import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
 import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type SessionInfo } from "./domain/status.ts";
 
-const execFileAsync = promisify(execFile);
+function execFileAsync(file: string, args: readonly string[]): Promise<{ stdout: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { timeout: muxTimeoutMs }, (error, stdout) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve({ stdout });
+    });
+  });
+}
 const stateDir = process.env.PI_TMUX_SESSION_MAP_STATE_DIR ?? defaultStateDir();
 const twsConfigDir = process.env.PI_TMUX_SESSION_MAP_TWS_CONFIG_DIR ?? join(homedir(), ".config", "tws");
 const twsStatusDir = process.env.PI_TMUX_SESSION_MAP_TWS_STATUS_DIR ?? join(twsConfigDir, "pi-status");
@@ -30,6 +41,15 @@ type EventAction = {
   mapping: boolean;
   status: StatusAction;
   cleanup?: boolean;
+  restoreReason?: string;
+  refreshPane?: boolean;
+};
+
+type ArtifactCache = {
+  paneInfo: PaneInfo | undefined;
+  paneInfoResolved: boolean;
+  mappingSignature: string | null;
+  statusSignature: string | null;
 };
 
 type AgentEndMessage = {
@@ -61,14 +81,13 @@ export function provisionalWorkState(finalState: FinalWorkState): WorkState {
   return finalState === "failed" ? "retrying" : finalState;
 }
 
-async function resolvePaneInfo(): Promise<PaneInfo | undefined> {
+export async function resolvePaneInfo(): Promise<PaneInfo | undefined> {
   const tmuxPane = process.env.TMUX_PANE;
   if (process.env.TMUX && tmuxPane) {
     try {
       const { stdout } = await execFileAsync(
         tmuxBin,
         ["display-message", "-p", "-t", tmuxPane, PANE_INFO_FORMAT],
-        { timeout: muxTimeoutMs },
       );
       return parsePaneInfoOutput(stdout, tmuxPane);
     } catch {
@@ -83,12 +102,16 @@ async function resolvePaneInfo(): Promise<PaneInfo | undefined> {
       const { stdout } = await execFileAsync(
         zellijBin,
         ["--session", zellijSession, "action", "list-panes", "--json", "--all"],
-        { timeout: muxTimeoutMs },
       );
       return parseZellijPaneInfo(stdout, zellijSession, zellijPane);
     } catch {
       return undefined;
     }
+  }
+
+  const mexSession = process.env.MEX_SESSION;
+  if (mexSession && !process.env.TMUX_PANE) {
+    return mexPaneInfo(mexSession);
   }
 
   return undefined;
@@ -108,11 +131,71 @@ async function touchTwsTrigger(path = twsTriggerFile): Promise<void> {
   }
 }
 
-async function writeSessionMapping(info: PaneInfo, sessionFile: string): Promise<void> {
+export function sessionMappingSignature(
+  info: PaneInfo,
+  session: SessionInfo,
+  sessionId: string,
+): string | null {
+  if (session.sessionFile === null || info.backend !== "tmux") {
+    return null;
+  }
+  return JSON.stringify([info.paneKey, session.sessionFile, sessionId, session.cwd, session.sessionName]);
+}
+
+export function twsStatusSignature(
+  info: PaneInfo,
+  session: SessionInfo,
+  state: WorkState,
+  startedAtMs: number | null,
+  finishedAtMs: number | null,
+): string {
+  return JSON.stringify([
+    info.backend,
+    info.paneKey,
+    info.paneId,
+    info.sessionName,
+    info.windowIndex,
+    info.paneIndex,
+    session.cwd,
+    session.sessionFile,
+    session.sessionName,
+    state,
+    startedAtMs,
+    finishedAtMs,
+  ]);
+}
+
+async function writeSessionMapping(info: PaneInfo, session: SessionInfo, sessionId: string): Promise<void> {
+  if (session.sessionFile === null) {
+    return;
+  }
   const fileName = mappingFileName(info.paneKey);
+  const mapping = buildSessionMapping(
+    info.paneKey,
+    session.sessionFile,
+    sessionId,
+    session.cwd,
+    session.sessionName,
+    Date.now(),
+  );
   await ensureDirectory(stateDir);
-  await writeAtomic(join(stateDir, fileName), `${sessionFile}\n`, 0o600);
-  await cleanupSupersededSessionMappings(stateDir, fileName, sessionFile);
+  await writeAtomic(join(stateDir, fileName), serializeSessionMapping(mapping), 0o600);
+  await cleanupSupersededSessionMappings(stateDir, fileName, session.sessionFile);
+}
+
+async function writeRestoreAcknowledgement(
+  info: PaneInfo,
+  session: SessionInfo,
+  sessionId: string,
+  reason: string,
+): Promise<void> {
+  const expectation = restoreExpectationFromEnvironment();
+  if (!expectation) {
+    return;
+  }
+  const ack = buildRestoreAck(expectation, info, session, sessionId, reason, Date.now());
+  await ensureDirectory(expectation.ackDir);
+  await writeAtomic(restoreAckPath(expectation), serializeRestoreAck(ack), 0o600);
 }
 
 function getSessionInfo(ctx: ExtensionContext): SessionInfo {
@@ -124,19 +207,26 @@ function getSessionInfo(ctx: ExtensionContext): SessionInfo {
 }
 
 function statusDirectory(info: PaneInfo): string {
-  if (info.backend === "zellij") {
-    return process.env.PI_TMUX_SESSION_MAP_ZELLIJ_STATUS_DIR
-      ?? join(homedir(), ".config", "tws-zellij", "pi-status");
+  switch (info.backend) {
+    case "zellij":
+      return process.env.PI_TMUX_SESSION_MAP_ZELLIJ_STATUS_DIR
+        ?? join(homedir(), ".config", "tws-zellij", "pi-status");
+    case "tmux":
+    case "mex":
+      // mex shares the default tws pi-status dir + trigger with tmux.
+      return twsStatusDir;
   }
-  return twsStatusDir;
 }
 
 function triggerFile(info: PaneInfo): string {
-  if (info.backend === "zellij") {
-    return process.env.PI_TMUX_SESSION_MAP_ZELLIJ_TRIGGER_FILE
-      ?? join(homedir(), ".config", "tws-zellij", "agent.trigger");
+  switch (info.backend) {
+    case "zellij":
+      return process.env.PI_TMUX_SESSION_MAP_ZELLIJ_TRIGGER_FILE
+        ?? join(homedir(), ".config", "tws-zellij", "agent.trigger");
+    case "tmux":
+    case "mex":
+      return twsTriggerFile;
   }
-  return twsTriggerFile;
 }
 
 async function writeTwsStatus(
@@ -171,6 +261,7 @@ async function applyEventAction(
   ctx: ExtensionContext,
   action: EventAction,
   runtimeState: RuntimeState,
+  artifactCache: ArtifactCache,
 ): Promise<RuntimeState> {
   const session = getSessionInfo(ctx);
   const mappingSessionFile = action.mapping ? session.sessionFile : null;
@@ -178,13 +269,24 @@ async function applyEventAction(
     return runtimeState;
   }
 
-  const info = await resolvePaneInfo();
+  if (action.refreshPane === true || !artifactCache.paneInfoResolved) {
+    artifactCache.paneInfo = await resolvePaneInfo();
+    artifactCache.paneInfoResolved = true;
+  }
+  const info = artifactCache.paneInfo;
   if (!info) {
     return runtimeState;
   }
 
-  if (mappingSessionFile !== null && info.backend === "tmux") {
-    await writeSessionMapping(info, mappingSessionFile);
+  const sessionId = ctx.sessionManager.getSessionId();
+  const mappingSignature = sessionMappingSignature(info, session, sessionId);
+  if (mappingSessionFile !== null && mappingSignature !== null && mappingSignature !== artifactCache.mappingSignature) {
+    await writeSessionMapping(info, session, sessionId);
+    artifactCache.mappingSignature = mappingSignature;
+  }
+
+  if (action.restoreReason !== undefined && info.backend === "tmux") {
+    await writeRestoreAcknowledgement(info, session, sessionId, action.restoreReason);
   }
 
   if (action.status === null) {
@@ -202,7 +304,19 @@ async function applyEventAction(
     return transition;
   }
 
+  const statusSignature = twsStatusSignature(
+    info,
+    session,
+    transition.state,
+    transition.startedAtMs,
+    transition.finishedAtMs,
+  );
+  if (statusSignature === artifactCache.statusSignature) {
+    return transition;
+  }
+
   await writeTwsStatus(info, session, transition.state, now, transition.startedAtMs, transition.finishedAtMs);
+  artifactCache.statusSignature = statusSignature;
   return transition;
 }
 
@@ -221,6 +335,12 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
   const errorReporter = createThrottledErrorReporter();
   let runtimeState = createRuntimeState();
   let pendingFinalState: FinalWorkState = "done";
+  const artifactCache: ArtifactCache = {
+    paneInfo: undefined,
+    paneInfoResolved: false,
+    mappingSignature: null,
+    statusSignature: null,
+  };
 
   const enqueue = async (ctx: ExtensionContext, action: EventAction) => {
     await queue.enqueue(async () => {
@@ -228,7 +348,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
         if (action.cleanup === true) {
           await cleanupStaleFiles();
         }
-        runtimeState = await applyEventAction(ctx, action, runtimeState);
+        runtimeState = await applyEventAction(ctx, action, runtimeState, artifactCache);
       } catch (error) {
         errorReporter.report("pi-tmux-session-map: failed to update sidecars", error);
       }
@@ -237,15 +357,26 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
 
   // Intentionally no cleanup on session_shutdown: the mapping must survive a
   // tmux server restart so resurrect can restore the exact session.
-  pi.on("session_start", async (_event, ctx) => {
-    await enqueue(ctx, { mapping: true, status: "idle", cleanup: true });
+  pi.on("session_start", async (event, ctx) => {
+    artifactCache.paneInfo = undefined;
+    artifactCache.paneInfoResolved = false;
+    artifactCache.mappingSignature = null;
+    artifactCache.statusSignature = null;
+    runtimeState = createRuntimeState();
+    await enqueue(ctx, {
+      mapping: true,
+      status: "idle",
+      cleanup: true,
+      restoreReason: event.reason,
+      refreshPane: true,
+    });
   });
   pi.on("session_info_changed", async (_event, ctx) => {
-    await enqueue(ctx, { mapping: true, status: "refresh" });
+    await enqueue(ctx, { mapping: true, status: "refresh", refreshPane: true });
   });
   pi.on("agent_start", async (_event, ctx) => {
     pendingFinalState = "done";
-    await enqueue(ctx, { mapping: true, status: "working" });
+    await enqueue(ctx, { mapping: true, status: "working", refreshPane: true });
   });
   // agent_end may be followed by automatic retry/compaction. Keep failures
   // provisional until agent_settled confirms that no continuation will run.
@@ -253,6 +384,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     pendingFinalState = finalWorkStateForMessages(event.messages);
     await enqueue(ctx, {
       mapping: true,
+      refreshPane: true,
       // Technical errors may still recover through Pi's automatic retry or
       // compaction flow. User aborts and token-limit responses are already
       // definitive and should not briefly look like retries.
@@ -264,5 +396,10 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     await enqueue(ctx, { mapping: false, status: "shutdown" });
+    artifactCache.paneInfo = undefined;
+    artifactCache.paneInfoResolved = false;
+    artifactCache.mappingSignature = null;
+    artifactCache.statusSignature = null;
+    runtimeState = createRuntimeState();
   });
 }

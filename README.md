@@ -37,7 +37,7 @@ Mappings are intentionally **not** removed on shutdown — they must survive `tm
 Requires Pi `0.80.5` or newer (`agent_settled` lifecycle event).
 
 ```sh
-pi install git:github.com/patlux/pi-tmux-session-map
+pi install npm:pi-tmux-session-map
 ```
 
 Then reload pi:

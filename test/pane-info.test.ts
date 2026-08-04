@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { parsePaneInfoOutput, parseTmuxIndex, parseZellijPaneInfo } from "../src/domain/pane-info.ts";
+import { mexPaneInfo, parsePaneInfoOutput, parseTmuxIndex, parseZellijPaneInfo } from "../src/domain/pane-info.ts";
 
 test("parseTmuxIndex parses decimal numbers and falls back to zero", () => {
   assert.equal(parseTmuxIndex("12"), 12);
@@ -23,6 +23,22 @@ test("parsePaneInfoOutput parses tmux pane info", () => {
 test("parsePaneInfoOutput rejects empty output and missing session name", () => {
   assert.equal(parsePaneInfoOutput("\n", "%1"), undefined);
   assert.equal(parsePaneInfoOutput("tws_proj:1.0\t\t1\t0\n", "%1"), undefined);
+});
+
+test("mexPaneInfo maps immutable MEX_SESSION id to pane identity", () => {
+  assert.deepEqual(mexPaneInfo("19fb891d9de001"), {
+    backend: "mex",
+    paneKey: "mex:19fb891d9de001",
+    paneId: "19fb891d9de001",
+    sessionName: "19fb891d9de001",
+    windowIndex: 0,
+    paneIndex: 0,
+  });
+});
+
+test("mexPaneInfo rejects empty session ids", () => {
+  assert.equal(mexPaneInfo(""), undefined);
+  assert.equal(mexPaneInfo(undefined), undefined);
 });
 
 test("parseZellijPaneInfo resolves a terminal pane and normalizes its id", () => {

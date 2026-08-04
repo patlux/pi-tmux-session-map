@@ -38,6 +38,20 @@ function isZellijPane(value: unknown): value is ZellijPane {
   return typeof value === "object" && value !== null;
 }
 
+export function mexPaneInfo(sessionId: string | undefined): PaneInfo | undefined {
+  if (!sessionId) {
+    return undefined;
+  }
+  return {
+    backend: "mex",
+    paneKey: `mex:${sessionId}`,
+    paneId: sessionId,
+    sessionName: sessionId,
+    windowIndex: 0,
+    paneIndex: 0,
+  };
+}
+
 export function parseZellijPaneInfo(
   stdout: string,
   sessionName: string,

@@ -43,6 +43,46 @@ test("buildTwsStatusPayload maps pane and session metadata", () => {
   });
 });
 
+test("buildTwsStatusPayload maps mex pane metadata", () => {
+  const payload = buildTwsStatusPayload(
+    {
+      backend: "mex",
+      paneKey: "mex:19fb891d9de001",
+      paneId: "19fb891d9de001",
+      sessionName: "19fb891d9de001",
+      windowIndex: 0,
+      paneIndex: 0,
+    },
+    {
+      cwd: "/tmp/project",
+      sessionFile: "/tmp/session.jsonl",
+      sessionName: "Review plugin",
+    },
+    "working",
+    3000,
+    1000,
+    null,
+  );
+
+  assert.deepEqual(payload, {
+    schema: 1,
+    agent: "pi",
+    backend: "mex",
+    pane_id: "19fb891d9de001",
+    pane_key: "mex:19fb891d9de001",
+    tmux_session_name: "19fb891d9de001",
+    window_index: 0,
+    pane_index: 0,
+    cwd: "/tmp/project",
+    session_file: "/tmp/session.jsonl",
+    session_name: "Review plugin",
+    state: "working",
+    updated_at_ms: 3000,
+    started_at_ms: 1000,
+    finished_at_ms: null,
+  });
+});
+
 test("serializeStatusPayload emits newline-terminated JSON", () => {
   const payload = buildTwsStatusPayload(
     {

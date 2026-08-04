@@ -1,6 +1,8 @@
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
+import { mappedSessionFile } from "./session-mapping.ts";
+
 let atomicWriteCounter = 0;
 
 export type CleanupResult = {
@@ -128,7 +130,7 @@ export async function cleanupSupersededSessionMappings(
       // A Pi session file is owned by exactly one live pane, so any other
       // mapping pointing at it is a stale key (window renamed / pane moved) or
       // a legacy-named duplicate of the current key.
-      const target = (await readFile(path, "utf8")).split(/\r?\n/, 1)[0]?.trim() ?? "";
+      const target = mappedSessionFile(await readFile(path, "utf8")) ?? "";
       if (target !== sessionFile) {
         continue;
       }
@@ -171,7 +173,7 @@ export async function cleanupStaleSessionMappings(
         continue;
       }
 
-      const sessionFile = (await readFile(path, "utf8")).split(/\r?\n/, 1)[0]?.trim() ?? "";
+      const sessionFile = mappedSessionFile(await readFile(path, "utf8")) ?? "";
       if (sessionFile !== "") {
         try {
           await stat(sessionFile);
