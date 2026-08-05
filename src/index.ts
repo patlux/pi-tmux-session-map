@@ -4,13 +4,13 @@ import { open, utimes } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededSessionMappings, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic } from "./domain/atomic-write.ts";
+import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic } from "./domain/atomic-write.ts";
 import { createAsyncQueue } from "./domain/async-queue.ts";
 import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
-import { PANE_KEY_FORMAT, defaultStateDir, mappingFileName, statusFileName } from "./domain/pane-key.ts";
+import { publishSessionMapping } from "./domain/mapping-publisher.ts";
+import { PANE_KEY_FORMAT, defaultStateDir, statusFileName } from "./domain/pane-key.ts";
 import { parsePaneInfoOutput, parseZellijPaneInfo, mexPaneInfo } from "./domain/pane-info.ts";
 import { buildRestoreAck, restoreAckPath, restoreExpectationFromEnvironment, serializeRestoreAck } from "./domain/restore-ack.ts";
-import { buildSessionMapping, serializeSessionMapping } from "./domain/session-mapping.ts";
 import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
 import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type SessionInfo } from "./domain/status.ts";
 
@@ -33,7 +33,11 @@ const tmuxBin = process.env.PI_TMUX_SESSION_MAP_TMUX_BIN ?? "tmux";
 const zellijBin = process.env.PI_TMUX_SESSION_MAP_ZELLIJ_BIN ?? "zellij";
 const muxTimeoutMs = 1000;
 const cleanupMaxAgeMs = 24 * 60 * 60 * 1000;
-const PANE_INFO_FORMAT = `${PANE_KEY_FORMAT}\t#{session_name}\t#{window_index}\t#{pane_index}`;
+const reconcileIntervalMs = Math.max(
+  10_000,
+  Number.parseInt(process.env.PI_TMUX_SESSION_MAP_RECONCILE_INTERVAL_MS ?? "60000", 10) || 60_000,
+);
+const PANE_INFO_FORMAT = `${PANE_KEY_FORMAT}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pid}`;
 
 type StatusAction = WorkState | "refresh" | null;
 
@@ -139,7 +143,24 @@ export function sessionMappingSignature(
   if (session.sessionFile === null || info.backend !== "tmux") {
     return null;
   }
-  return JSON.stringify([info.paneKey, session.sessionFile, sessionId, session.cwd, session.sessionName]);
+  return JSON.stringify([
+    info.paneKey,
+    info.paneId,
+    info.tmuxServerPid,
+    session.sessionFile,
+    sessionId,
+    session.cwd,
+    session.sessionName,
+  ]);
+}
+
+export function reconciliationDelayMs(identity: string, intervalMs = reconcileIntervalMs): number {
+  let hash = 2166136261;
+  for (const byte of Buffer.from(identity, "utf8")) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash % intervalMs;
 }
 
 export function twsStatusSignature(
@@ -153,6 +174,7 @@ export function twsStatusSignature(
     info.backend,
     info.paneKey,
     info.paneId,
+    info.tmuxServerPid,
     info.sessionName,
     info.windowIndex,
     info.paneIndex,
@@ -165,22 +187,8 @@ export function twsStatusSignature(
   ]);
 }
 
-async function writeSessionMapping(info: PaneInfo, session: SessionInfo, sessionId: string): Promise<void> {
-  if (session.sessionFile === null) {
-    return;
-  }
-  const fileName = mappingFileName(info.paneKey);
-  const mapping = buildSessionMapping(
-    info.paneKey,
-    session.sessionFile,
-    sessionId,
-    session.cwd,
-    session.sessionName,
-    Date.now(),
-  );
-  await ensureDirectory(stateDir);
-  await writeAtomic(join(stateDir, fileName), serializeSessionMapping(mapping), 0o600);
-  await cleanupSupersededSessionMappings(stateDir, fileName, session.sessionFile);
+async function writeSessionMapping(info: PaneInfo, session: SessionInfo, sessionId: string): Promise<boolean> {
+  return (await publishSessionMapping(stateDir, info, session, sessionId)) !== undefined;
 }
 
 async function writeRestoreAcknowledgement(
@@ -281,8 +289,8 @@ async function applyEventAction(
   const sessionId = ctx.sessionManager.getSessionId();
   const mappingSignature = sessionMappingSignature(info, session, sessionId);
   if (mappingSessionFile !== null && mappingSignature !== null && mappingSignature !== artifactCache.mappingSignature) {
-    await writeSessionMapping(info, session, sessionId);
-    artifactCache.mappingSignature = mappingSignature;
+    const published = await writeSessionMapping(info, session, sessionId);
+    artifactCache.mappingSignature = published ? mappingSignature : null;
   }
 
   if (action.restoreReason !== undefined && info.backend === "tmux") {
@@ -355,6 +363,40 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     });
   };
 
+  let reconciliationTimer: ReturnType<typeof setTimeout> | undefined;
+  let reconciliationActive = false;
+
+  const stopReconciliation = () => {
+    reconciliationActive = false;
+    if (reconciliationTimer !== undefined) {
+      clearTimeout(reconciliationTimer);
+      reconciliationTimer = undefined;
+    }
+  };
+
+  const scheduleReconciliation = (ctx: ExtensionContext, delayMs: number) => {
+    reconciliationTimer = setTimeout(async () => {
+      reconciliationTimer = undefined;
+      if (!reconciliationActive) {
+        return;
+      }
+      await enqueue(ctx, { mapping: true, status: "refresh", refreshPane: true });
+      if (reconciliationActive) {
+        scheduleReconciliation(ctx, reconcileIntervalMs);
+      }
+    }, delayMs);
+    reconciliationTimer.unref();
+  };
+
+  const startReconciliation = (ctx: ExtensionContext) => {
+    stopReconciliation();
+    if (!process.env.TMUX || !process.env.TMUX_PANE) {
+      return;
+    }
+    reconciliationActive = true;
+    scheduleReconciliation(ctx, reconciliationDelayMs(process.env.TMUX_PANE));
+  };
+
   // Intentionally no cleanup on session_shutdown: the mapping must survive a
   // tmux server restart so resurrect can restore the exact session.
   pi.on("session_start", async (event, ctx) => {
@@ -370,6 +412,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
       restoreReason: event.reason,
       refreshPane: true,
     });
+    startReconciliation(ctx);
   });
   pi.on("session_info_changed", async (_event, ctx) => {
     await enqueue(ctx, { mapping: true, status: "refresh", refreshPane: true });
@@ -395,6 +438,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     await enqueue(ctx, { mapping: true, status: pendingFinalState });
   });
   pi.on("session_shutdown", async (_event, ctx) => {
+    stopReconciliation();
     await enqueue(ctx, { mapping: false, status: "shutdown" });
     artifactCache.paneInfo = undefined;
     artifactCache.paneInfoResolved = false;

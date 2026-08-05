@@ -7,6 +7,7 @@ const pane = {
   backend: "tmux" as const,
   paneKey: "tws_project_main:1.0",
   paneId: "%42",
+  tmuxServerPid: "89538",
   sessionName: "tws_project_main",
   windowIndex: 1,
   paneIndex: 0,

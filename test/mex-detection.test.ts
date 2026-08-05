@@ -44,6 +44,7 @@ test("resolvePaneInfo detects immutable mex id from MEX_SESSION", async () => {
     backend: "mex",
     paneKey: "mex:19fb891d9de001",
     paneId: "19fb891d9de001",
+    tmuxServerPid: null,
     sessionName: "19fb891d9de001",
     windowIndex: 0,
     paneIndex: 0,

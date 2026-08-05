@@ -48,6 +48,11 @@ export function mappingFileName(key: string): string {
   return `${keyFileStem(key)}.session`;
 }
 
+/** Stable live-pane alias used to reconcile index changes while tmux runs. */
+export function paneIdMappingFileName(paneId: string): string {
+  return `pane-id-${keyFileStem(paneId)}.session`;
+}
+
 /** File name of the tws status file for a raw pane key. */
 export function statusFileName(key: string): string {
   return `${keyFileStem(key)}.json`;

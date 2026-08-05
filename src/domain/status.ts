@@ -4,6 +4,7 @@ export type PaneInfo = {
   backend: "tmux" | "zellij" | "mex";
   paneKey: string;
   paneId: string;
+  tmuxServerPid: string | null;
   sessionName: string;
   windowIndex: number;
   paneIndex: number;

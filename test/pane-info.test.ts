@@ -10,10 +10,11 @@ test("parseTmuxIndex parses decimal numbers and falls back to zero", () => {
 });
 
 test("parsePaneInfoOutput parses tmux pane info", () => {
-  assert.deepEqual(parsePaneInfoOutput("tws_proj:1.0\ttws_proj\t1\t0\n", "%42"), {
+  assert.deepEqual(parsePaneInfoOutput("tws_proj:1.0\ttws_proj\t1\t0\t89538\n", "%42"), {
     backend: "tmux",
     paneKey: "tws_proj:1.0",
     paneId: "%42",
+    tmuxServerPid: "89538",
     sessionName: "tws_proj",
     windowIndex: 1,
     paneIndex: 0,
@@ -30,6 +31,7 @@ test("mexPaneInfo maps immutable MEX_SESSION id to pane identity", () => {
     backend: "mex",
     paneKey: "mex:19fb891d9de001",
     paneId: "19fb891d9de001",
+    tmuxServerPid: null,
     sessionName: "19fb891d9de001",
     windowIndex: 0,
     paneIndex: 0,
@@ -50,6 +52,7 @@ test("parseZellijPaneInfo resolves a terminal pane and normalizes its id", () =>
     backend: "zellij",
     paneKey: "twz_personal_infra_main:3.42",
     paneId: "terminal_42",
+    tmuxServerPid: null,
     sessionName: "twz_personal_infra_main",
     windowIndex: 3,
     paneIndex: 42,

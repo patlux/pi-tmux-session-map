@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
-import { mappedSessionFile } from "./session-mapping.ts";
+import { mappedPaneIdentity, mappedSessionFile } from "./session-mapping.ts";
 
 let atomicWriteCounter = 0;
 
@@ -108,8 +108,9 @@ export async function cleanupSupersededStatusFiles(
 
 export async function cleanupSupersededSessionMappings(
   dir: string,
-  currentFileName: string,
+  currentFileNames: string | readonly string[],
   sessionFile: string,
+  paneIdentity?: { paneId: string; tmuxServerPid: string },
 ): Promise<CleanupResult> {
   let entries: string[];
   try {
@@ -118,20 +119,28 @@ export async function cleanupSupersededSessionMappings(
     return { scanned: 0, removed: 0 };
   }
 
+  const retained = new Set(
+    typeof currentFileNames === "string" ? [currentFileNames] : currentFileNames,
+  );
   let scanned = 0;
   let removed = 0;
   for (const entry of entries) {
-    if (!entry.endsWith(".session") || entry === currentFileName) {
+    if (!entry.endsWith(".session") || retained.has(entry)) {
       continue;
     }
     scanned += 1;
     const path = join(dir, entry);
     try {
-      // A Pi session file is owned by exactly one live pane, so any other
-      // mapping pointing at it is a stale key (window renamed / pane moved) or
-      // a legacy-named duplicate of the current key.
-      const target = mappedSessionFile(await readFile(path, "utf8")) ?? "";
-      if (target !== sessionFile) {
+      const content = await readFile(path, "utf8");
+      // A Pi session and a live tmux pane id each have one current owner. A
+      // match on either identity proves this is an old key or alias, but only
+      // after the caller has atomically published the replacement files.
+      const sameSession = mappedSessionFile(content) === sessionFile;
+      const mappedIdentity = mappedPaneIdentity(content);
+      const samePane = paneIdentity !== undefined
+        && mappedIdentity?.paneId === paneIdentity.paneId
+        && mappedIdentity.tmuxServerPid === paneIdentity.tmuxServerPid;
+      if (!sameSession && !samePane) {
         continue;
       }
       await rm(path, { force: true });

@@ -12,7 +12,7 @@ export function parsePaneInfoOutput(stdout: string, paneId: string): PaneInfo | 
     return undefined;
   }
 
-  const [rawPaneKey, sessionName, rawWindowIndex, rawPaneIndex] = trimmed.split("\t");
+  const [rawPaneKey, sessionName, rawWindowIndex, rawPaneIndex, tmuxServerPid] = trimmed.split("\t");
   const paneKey = normalizePaneKey(rawPaneKey ?? "");
   if (!paneKey || !sessionName) {
     return undefined;
@@ -22,6 +22,7 @@ export function parsePaneInfoOutput(stdout: string, paneId: string): PaneInfo | 
     backend: "tmux",
     paneKey,
     paneId,
+    tmuxServerPid: tmuxServerPid || null,
     sessionName,
     windowIndex: parseTmuxIndex(rawWindowIndex ?? "0"),
     paneIndex: parseTmuxIndex(rawPaneIndex ?? "0"),
@@ -46,6 +47,7 @@ export function mexPaneInfo(sessionId: string | undefined): PaneInfo | undefined
     backend: "mex",
     paneKey: `mex:${sessionId}`,
     paneId: sessionId,
+    tmuxServerPid: null,
     sessionName: sessionId,
     windowIndex: 0,
     paneIndex: 0,
@@ -85,6 +87,7 @@ export function parseZellijPaneInfo(
     backend: "zellij",
     paneKey: `${sessionName}:${tabPosition}.${numericId}`,
     paneId: normalizedPaneId,
+    tmuxServerPid: null,
     sessionName,
     windowIndex: tabPosition,
     paneIndex: numericId,

@@ -10,27 +10,31 @@ It also writes [tws](https://github.com/ytaskiran/tws)-compatible Pi work-status
 
 ## How it works
 
-The extension resolves a stable tmux pane key:
+The extension records two complementary tmux identities:
 
-```
-#{session_name}:#{window_index}.#{pane_index}
+```text
+restart identity: #{session_name}:#{window_index}.#{pane_index}
+live identity:    (#{pid}, #{pane_id})
 ```
 
-That key is stable across tmux server restarts (unlike pane ids like `%42`), which is exactly what tmux-resurrect restores. File names use a readable sanitized prefix plus a 12-character SHA-256 suffix so different pane keys cannot collide and very long tmux session names stay below filesystem filename limits.
+The pane key is what tmux-resurrect recreates across server restarts. The server-PID/pane-ID pair remains stable while one tmux server is running, even when windows or panes are renumbered. A periodic, jittered reconciliation resolves the current key for the live pane ID and atomically republishes the mapping under the new key. Pane IDs are never trusted across a tmux server restart because tmux can reuse them.
+
+File names use a readable sanitized prefix plus a 12-character SHA-256 suffix so different identities cannot collide and very long tmux session names stay below filesystem filename limits.
 
 For tmux it writes the exact-resume mapping and status sidecar. For Zellij it writes only the status sidecar because Zellij owns session resurrection itself:
 
 ```text
 ~/.local/state/pi/tmux-sessions/<sanitized-pane-key>-<sha256-12>.session
+~/.local/state/pi/tmux-sessions/pane-id-<sanitized-pane-id>-<sha256-12>.session
 ~/.config/tws/pi-status/<sanitized-pane-key>-<sha256-12>.json
 ~/.config/tws-zellij/pi-status/<sanitized-pane-key>-<sha256-12>.json
 ```
 
-The `.session` file contains the active Pi session file path. It is written on `session_start`, `session_info_changed`, `agent_start`, and `agent_end` when the current Pi session has a backing session file.
+The `.session` files contain schema-3 JSON with pane key, pane ID, tmux server PID, exact Pi session path and ID, cwd, and session name. They are written only after the JSONL exists and its session header matches Pi's current session ID. Writes occur on Pi lifecycle events and periodic reconciliation. A replacement key and pane-ID alias are published atomically before stale names are removed, so interruption can leave duplicates but never a mapping gap.
 
 The `.json` file contains the multiplexer backend, tws work state (`idle`, `working`, `retrying`, `done`, `cancelled`, `incomplete`, `failed`, `shutdown`), and pane/session metadata. A technical-error `agent_end` is provisional `retrying`; aborts and token-limit responses become `cancelled`/`incomplete` immediately. `agent_settled` confirms the final outcome (`failed` if recovery did not succeed). The extension touches the matching `agent.trigger` file after status writes so that edition refreshes within one poll tick.
 
-Mappings are intentionally **not** removed on shutdown — they must survive `tmux kill-server` so resurrect can use them. Every Pi start in a pane overwrites that pane's mapping, so stale entries self-heal. Very old mapping files and interrupted atomic-write temp files are cleaned up opportunistically on session start.
+Mappings are intentionally **not** removed on shutdown — they must survive `tmux kill-server` so resurrect can use them. During one live tmux server, reconciliation self-heals pane renumbering through the stable pane-ID alias. After a server restart, consumers ignore old aliases and use the restart-stable pane key. Very old missing-target mappings and interrupted atomic-write temp files are cleaned up opportunistically on session start.
 
 ## Install
 
@@ -101,7 +105,8 @@ If the recorded session file no longer exists, the wrapper falls back to `pi --c
 
 ## Caveats
 
-- Pane keys use window/pane *indexes*: if you reorder windows or panes between save and restore, a mapping can point at a sibling pane's session. It self-heals on the next Pi start.
+- Pane IDs are scoped to one tmux server and may be reused after restart. Schema 3 therefore includes the tmux server PID and consumers require both values before using a live alias.
+- A Pi process whose current session has no valid on-disk JSONL cannot be mapped exactly. The extension fails closed and waits for a later lifecycle event or reconciliation instead of publishing a speculative path.
 
 ## License
 
@@ -116,6 +121,7 @@ Optional environment variables for hardening or local integration:
 - `PI_TMUX_SESSION_MAP_TWS_STATUS_DIR` — override only the tws status directory.
 - `PI_TMUX_SESSION_MAP_TWS_TRIGGER_FILE` — override the tws trigger file.
 - `PI_TMUX_SESSION_MAP_TMUX_BIN` — override the `tmux` binary path.
+- `PI_TMUX_SESSION_MAP_RECONCILE_INTERVAL_MS` — periodic mapping reconciliation interval; minimum 10 seconds, default 60 seconds, deterministically jittered per pane.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_BIN` — override the `zellij` binary path.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_STATUS_DIR` — override the Zellij TWS status directory.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_TRIGGER_FILE` — override the Zellij TWS trigger file.

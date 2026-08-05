@@ -83,13 +83,13 @@ test("cleanupSupersededSessionMappings removes other mappings pointing at the sa
   await withTempDir(async (dir) => {
     const target = join(dir, "session-019f272f.jsonl");
     // Same live session reached under an old key name and a legacy filename.
-    await writeFile(join(dir, "tws_a_progress_1.0-hash.session"), `${JSON.stringify({ schema: 2, paneKey: "a:1.0", sessionFile: target, sessionId: "id", cwd: dir, sessionName: null, updatedAtMs: 1 })}\n`);
+    await writeFile(join(dir, "tws_a_progress_1.0-hash.session"), `${JSON.stringify({ schema: 3, paneKey: "a:1.0", paneId: "%22", tmuxServerPid: "89538", sessionFile: target, sessionId: "id", cwd: dir, sessionName: null, updatedAtMs: 1 })}\n`);
     await writeFile(join(dir, "tws_a_notification_1.0.session"), `${target}\n`);
     await writeFile(join(dir, "tws_a_notification_1.0-old.session"), `${target}\n`);
     // Unrelated session must survive.
     await writeFile(join(dir, "tws_b_other_1.0-hash.session"), `${join(dir, "other.jsonl")}\n`);
 
-    const result = await cleanupSupersededSessionMappings(dir, "tws_a_progress_1.0-hash.session", target);
+    const result = await cleanupSupersededSessionMappings(dir, "tws_a_progress_1.0-hash.session", target, { paneId: "%22", tmuxServerPid: "89538" });
 
     assert.equal(result.scanned, 3);
     assert.equal(result.removed, 2);
@@ -97,6 +97,25 @@ test("cleanupSupersededSessionMappings removes other mappings pointing at the sa
       "tws_a_progress_1.0-hash.session",
       "tws_b_other_1.0-hash.session",
     ]);
+  });
+});
+
+test("cleanupSupersededSessionMappings removes an old key for the same stable pane id", async () => {
+  await withTempDir(async (dir) => {
+    const current = "current.session";
+    const alias = "pane-id.session";
+    const oldKey = "old-key.session";
+    const target = join(dir, "session.jsonl");
+    const currentMapping = JSON.stringify({ schema: 3, paneKey: "work:3.0", paneId: "%42", tmuxServerPid: "89538", sessionFile: target, sessionId: "id", cwd: dir, sessionName: null, updatedAtMs: 3 });
+    const oldMapping = JSON.stringify({ schema: 3, paneKey: "work:2.0", paneId: "%42", tmuxServerPid: "89538", sessionFile: join(dir, "old.jsonl"), sessionId: "old", cwd: dir, sessionName: null, updatedAtMs: 1 });
+    await writeFile(join(dir, current), `${currentMapping}\n`);
+    await writeFile(join(dir, alias), `${currentMapping}\n`);
+    await writeFile(join(dir, oldKey), `${oldMapping}\n`);
+
+    const result = await cleanupSupersededSessionMappings(dir, [current, alias], target, { paneId: "%42", tmuxServerPid: "89538" });
+
+    assert.equal(result.removed, 1);
+    assert.deepEqual((await readdir(dir)).sort(), [alias, current].sort());
   });
 });
 
