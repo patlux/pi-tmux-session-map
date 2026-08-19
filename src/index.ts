@@ -10,6 +10,7 @@ import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
 import { publishSessionMapping } from "./domain/mapping-publisher.ts";
 import { PANE_KEY_FORMAT, defaultStateDir, statusFileName } from "./domain/pane-key.ts";
 import { parsePaneInfoOutput, parseZellijPaneInfo, mexPaneInfo } from "./domain/pane-info.ts";
+import { ownsInteractivePane, paneOwnershipEvidence } from "./domain/pane-ownership.ts";
 import { buildRestoreAck, restoreAckPath, restoreExpectationFromEnvironment, serializeRestoreAck } from "./domain/restore-ack.ts";
 import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
 import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type SessionInfo } from "./domain/status.ts";
@@ -271,6 +272,10 @@ async function applyEventAction(
   runtimeState: RuntimeState,
   artifactCache: ArtifactCache,
 ): Promise<RuntimeState> {
+  if (!ownsInteractivePane(paneOwnershipEvidence(ctx.mode, process.stdin.isTTY))) {
+    return runtimeState;
+  }
+
   const session = getSessionInfo(ctx);
   const mappingSessionFile = action.mapping ? session.sessionFile : null;
   if (mappingSessionFile === null && action.status === null) {
@@ -390,7 +395,11 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
 
   const startReconciliation = (ctx: ExtensionContext) => {
     stopReconciliation();
-    if (!process.env.TMUX || !process.env.TMUX_PANE) {
+    if (
+      !process.env.TMUX
+      || !process.env.TMUX_PANE
+      || !ownsInteractivePane(paneOwnershipEvidence(ctx.mode, process.stdin.isTTY))
+    ) {
       return;
     }
     reconciliationActive = true;

@@ -30,7 +30,7 @@ For tmux it writes the exact-resume mapping and status sidecar. For Zellij it wr
 ~/.config/tws-zellij/pi-status/<sanitized-pane-key>-<sha256-12>.json
 ```
 
-The `.session` files contain schema-3 JSON with pane key, pane ID, tmux server PID, exact Pi session path and ID, cwd, and session name. They are written only after the JSONL exists and its session header matches Pi's current session ID. Writes occur on Pi lifecycle events and periodic reconciliation. A replacement key and pane-ID alias are published atomically before stale names are removed, so interruption can leave duplicates but never a mapping gap.
+The `.session` files contain schema-3 JSON with pane key, pane ID, tmux server PID, exact Pi session path and ID, cwd, and session name. They are written only by an interactive Pi TUI with a real stdin TTY, never by a headless `pi-subagents` child that merely inherited the parent's tmux environment. Publication also requires that the JSONL exists and its session header matches Pi's current session ID. Writes occur on Pi lifecycle events and periodic reconciliation. A replacement key and pane-ID alias are published atomically before stale names are removed, so interruption can leave duplicates but never a mapping gap.
 
 The `.json` file contains the multiplexer backend, tws work state (`idle`, `working`, `retrying`, `done`, `cancelled`, `incomplete`, `failed`, `shutdown`), and pane/session metadata. A technical-error `agent_end` is provisional `retrying`; aborts and token-limit responses become `cancelled`/`incomplete` immediately. `agent_settled` confirms the final outcome (`failed` if recovery did not succeed). The extension touches the matching `agent.trigger` file after status writes so that edition refreshes within one poll tick.
 
@@ -99,7 +99,7 @@ set -g @resurrect-processes '"~pi-coding-agent/dist/cli.js->pi-tmux-resume"'
 
 ## Behavior
 
-The exact session mapping is written only when Pi runs inside tmux (`$TMUX` and `$TMUX_PANE` set) and the current session has a backing session file. The tws status file is written inside either tmux or Zellij (`$ZELLIJ`, `$ZELLIJ_SESSION_NAME`, and `$ZELLIJ_PANE_ID`), even when the Pi session file is not available yet; `session_file` is `null` until Pi creates one. Final failure-like outcomes are delayed until `agent_settled`, so automatic retries or compaction recovery do not appear as permanent failures.
+The exact session mapping and pane-scoped tws status are written only when Pi is an interactive TUI with a real stdin TTY and is not marked as a `PI_SUBAGENT_CHILD`. Tmux additionally requires `$TMUX` and `$TMUX_PANE`; Zellij requires `$ZELLIJ`, `$ZELLIJ_SESSION_NAME`, and `$ZELLIJ_PANE_ID`. This ownership gate prevents invisible headless children from replacing the visible parent's resume identity or work status. When an eligible interactive session has no Pi session file yet, the status `session_file` remains `null`. Final failure-like outcomes are delayed until `agent_settled`, so automatic retries or compaction recovery do not appear as permanent failures.
 
 If the recorded session file no longer exists, the wrapper falls back to `pi --continue` for the pane's working directory.
 
