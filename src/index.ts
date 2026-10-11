@@ -170,6 +170,7 @@ export function twsStatusSignature(
   state: WorkState,
   startedAtMs: number | null,
   finishedAtMs: number | null,
+  sessionId: string,
 ): string {
   return JSON.stringify([
     info.backend,
@@ -182,6 +183,7 @@ export function twsStatusSignature(
     session.cwd,
     session.sessionFile,
     session.sessionName,
+    sessionId,
     state,
     startedAtMs,
     finishedAtMs,
@@ -245,8 +247,10 @@ async function writeTwsStatus(
   updatedAtMs: number,
   startedAtMs: number | null,
   finishedAtMs: number | null,
+  sessionId: string,
 ): Promise<void> {
-  const payload = buildTwsStatusPayload(info, session, state, updatedAtMs, startedAtMs, finishedAtMs);
+  const payload = buildTwsStatusPayload(info, session, state, updatedAtMs, startedAtMs, finishedAtMs,
+    { sessionId, piPid: process.pid });
 
   const directory = statusDirectory(info);
   const fileName = statusFileName(info.paneKey);
@@ -323,12 +327,13 @@ async function applyEventAction(
     transition.state,
     transition.startedAtMs,
     transition.finishedAtMs,
+    sessionId,
   );
   if (statusSignature === artifactCache.statusSignature) {
     return transition;
   }
 
-  await writeTwsStatus(info, session, transition.state, now, transition.startedAtMs, transition.finishedAtMs);
+  await writeTwsStatus(info, session, transition.state, now, transition.startedAtMs, transition.finishedAtMs, sessionId);
   artifactCache.statusSignature = statusSignature;
   return transition;
 }

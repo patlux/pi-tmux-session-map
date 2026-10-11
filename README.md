@@ -32,6 +32,13 @@ For tmux it writes the exact-resume mapping and status sidecar. For Zellij it wr
 
 The `.session` files contain schema-3 JSON with pane key, pane ID, tmux server PID, exact Pi session path and ID, cwd, and session name. They are written only by an interactive Pi TUI with a real stdin TTY, never by a headless `pi-subagents` child that merely inherited the parent's tmux environment. Publication also requires that the JSONL exists and its session header matches Pi's current session ID. Writes occur on Pi lifecycle events and periodic reconciliation. A replacement key and pane-ID alias are published atomically before stale names are removed, so interruption can leave duplicates but never a mapping gap.
 
+The status `.json` also publishes `session_id`, `pi_pid` and `tmux_server_pid`.
+This live identity comes directly from Pi at session start, even before its JSONL
+exists. Consumers must match the foreground Pi PID, tmux server and pane, reject
+shutdown/stale status, and revalidate before copying. The session ID is therefore
+available before the first message; a resume command still requires a matching
+on-disk header. The durable `.session` mappings retain their persistence checks.
+
 The `.json` file contains the multiplexer backend, tws work state (`idle`, `working`, `retrying`, `done`, `cancelled`, `incomplete`, `failed`, `shutdown`), and pane/session metadata. A technical-error `agent_end` is provisional `retrying`; aborts and token-limit responses become `cancelled`/`incomplete` immediately. `agent_settled` confirms the final outcome (`failed` if recovery did not succeed). The extension touches the matching `agent.trigger` file after status writes so that edition refreshes within one poll tick.
 
 Mappings are intentionally **not** removed on shutdown — they must survive `tmux kill-server` so resurrect can use them. During one live tmux server, reconciliation self-heals pane renumbering through the stable pane-ID alias. After a server restart, consumers ignore old aliases and use the restart-stable pane key. Very old missing-target mappings and interrupted atomic-write temp files are cleaned up opportunistically on session start.
@@ -99,14 +106,14 @@ set -g @resurrect-processes '"~pi-coding-agent/dist/cli.js->pi-tmux-resume"'
 
 ## Behavior
 
-The exact session mapping and pane-scoped tws status are written only when Pi is an interactive TUI with a real stdin TTY and is not marked as a `PI_SUBAGENT_CHILD`. Tmux additionally requires `$TMUX` and `$TMUX_PANE`; Zellij requires `$ZELLIJ`, `$ZELLIJ_SESSION_NAME`, and `$ZELLIJ_PANE_ID`. This ownership gate prevents invisible headless children from replacing the visible parent's resume identity or work status. When an eligible interactive session has no Pi session file yet, the status `session_file` remains `null`. Final failure-like outcomes are delayed until `agent_settled`, so automatic retries or compaction recovery do not appear as permanent failures.
+The exact session mapping and pane-scoped tws status are written only when Pi is an interactive TUI with a real stdin TTY and is not marked as a `PI_SUBAGENT_CHILD`. Tmux additionally requires `$TMUX` and `$TMUX_PANE`; Zellij requires `$ZELLIJ`, `$ZELLIJ_SESSION_NAME`, and `$ZELLIJ_PANE_ID`. This ownership gate prevents invisible headless children from replacing the visible parent's resume identity or work status. When an eligible interactive session has no Pi session path, the status `session_file` is `null`. Pi can also supply a planned path before the file exists; that path alone is not proof of resumability. The live `session_id` remains available in either case. Final failure-like outcomes are delayed until `agent_settled`, so automatic retries or compaction recovery do not appear as permanent failures.
 
 If the recorded session file no longer exists, the wrapper falls back to `pi --continue` for the pane's working directory.
 
 ## Caveats
 
 - Pane IDs are scoped to one tmux server and may be reused after restart. Schema 3 therefore includes the tmux server PID and consumers require both values before using a live alias.
-- A Pi process whose current session has no valid on-disk JSONL cannot be mapped exactly. The extension fails closed and waits for a later lifecycle event or reconciliation instead of publishing a speculative path.
+- A Pi process without a valid on-disk JSONL has a live identity but no durable resume mapping. The extension waits for persistence before publishing a resume alias; it never creates session history merely to make a command available.
 
 ## License
 

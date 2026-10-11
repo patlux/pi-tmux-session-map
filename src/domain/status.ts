@@ -16,6 +16,11 @@ export type SessionInfo = {
   sessionName: string | null;
 };
 
+export type LiveSessionIdentity = {
+  sessionId: string;
+  piPid: number;
+};
+
 export type TwsStatusPayload = {
   schema: 1;
   agent: "pi";
@@ -28,6 +33,10 @@ export type TwsStatusPayload = {
   cwd: string;
   session_file: string | null;
   session_name: string | null;
+  // Additive live identity: valid even before the session JSONL exists.
+  session_id: string;
+  pi_pid: number;
+  tmux_server_pid: string | null;
   state: WorkState;
   updated_at_ms: number;
   started_at_ms: number | null;
@@ -41,6 +50,7 @@ export function buildTwsStatusPayload(
   updatedAtMs: number,
   startedAtMs: number | null,
   finishedAtMs: number | null,
+  identity: LiveSessionIdentity,
 ): TwsStatusPayload {
   return {
     schema: 1,
@@ -54,6 +64,9 @@ export function buildTwsStatusPayload(
     cwd: session.cwd,
     session_file: session.sessionFile,
     session_name: session.sessionName,
+    session_id: identity.sessionId,
+    pi_pid: identity.piPid,
+    tmux_server_pid: pane.tmuxServerPid,
     state,
     updated_at_ms: updatedAtMs,
     started_at_ms: startedAtMs,

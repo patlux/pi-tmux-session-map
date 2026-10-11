@@ -60,12 +60,16 @@ test("artifact signatures deduplicate unchanged mapping and status content", () 
     sessionMappingSignature(pane, { ...session, sessionName: "Renamed" }, "session-id"),
   );
   assert.equal(
-    twsStatusSignature(pane, session, "working", 10, null),
-    twsStatusSignature(pane, { ...session }, "working", 10, null),
+    twsStatusSignature(pane, session, "working", 10, null, "session-id"),
+    twsStatusSignature(pane, { ...session }, "working", 10, null, "session-id"),
   );
   assert.notEqual(
-    twsStatusSignature(pane, session, "working", 10, null),
-    twsStatusSignature(pane, session, "done", 10, 20),
+    twsStatusSignature(pane, session, "working", 10, null, "session-id"),
+    twsStatusSignature(pane, session, "done", 10, 20, "session-id"),
+  );
+  assert.notEqual(
+    twsStatusSignature(pane, { ...session, sessionFile: null }, "idle", null, null, "first"),
+    twsStatusSignature(pane, { ...session, sessionFile: null }, "idle", null, null, "second"),
   );
 });
 

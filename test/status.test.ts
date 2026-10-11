@@ -23,6 +23,7 @@ test("buildTwsStatusPayload maps pane and session metadata", () => {
     2000,
     1000,
     2000,
+    { sessionId: "saved-session", piPid: 321 },
   );
 
   assert.deepEqual(payload, {
@@ -37,6 +38,9 @@ test("buildTwsStatusPayload maps pane and session metadata", () => {
     cwd: "/tmp/project",
     session_file: "/tmp/session.jsonl",
     session_name: "Review plugin",
+    session_id: "saved-session",
+    pi_pid: 321,
+    tmux_server_pid: "89538",
     state: "done",
     updated_at_ms: 2000,
     started_at_ms: 1000,
@@ -64,6 +68,7 @@ test("buildTwsStatusPayload maps mex pane metadata", () => {
     3000,
     1000,
     null,
+    { sessionId: "mex-session", piPid: 654 },
   );
 
   assert.deepEqual(payload, {
@@ -78,6 +83,9 @@ test("buildTwsStatusPayload maps mex pane metadata", () => {
     cwd: "/tmp/project",
     session_file: "/tmp/session.jsonl",
     session_name: "Review plugin",
+    session_id: "mex-session",
+    pi_pid: 654,
+    tmux_server_pid: null,
     state: "working",
     updated_at_ms: 3000,
     started_at_ms: 1000,
@@ -105,7 +113,12 @@ test("serializeStatusPayload emits newline-terminated JSON", () => {
     1,
     null,
     null,
+    { sessionId: "unsaved-session", piPid: 987 },
   );
+  assert.equal(payload.session_file, null);
+  assert.equal(payload.session_id, "unsaved-session");
+  assert.equal(payload.pi_pid, 987);
+  assert.equal(payload.tmux_server_pid, "89538");
 
   const serialized = serializeStatusPayload(payload);
   assert.equal(serialized.endsWith("\n"), true);
