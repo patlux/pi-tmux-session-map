@@ -69,6 +69,9 @@ test("an acknowledged restore with a plan sends one visible continuation and adm
   await handlers.agent_end!({ messages: [{ role: "assistant", stopReason: "stop" }] }, session.ctx);
   await handlers.agent_settled!({ aborted: false }, session.ctx);
   assert.equal(json(join(ledgerDir, `${plan.key}.outcome`)).outcome, "done");
+  await sleep(50);
+  // found by the real-Pi layer B drill: a change of `continue` alone was deduplicated away
+  assert.equal(harness.readStatusFor(session.id).continue, "done", "the sidecar shows the final outcome");
   await handlers.session_shutdown!({ reason: "quit" }, session.ctx);
   assert.equal(sent.length, 1, "never a second message");
 });

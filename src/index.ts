@@ -212,6 +212,7 @@ export function twsStatusSignature(
   return JSON.stringify([
     evidence.runAnchor,
     evidence.shutdownCause,
+    evidence.continueState ?? null,
     info.backend,
     info.paneKey,
     info.paneId,
