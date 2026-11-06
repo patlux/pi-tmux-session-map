@@ -167,6 +167,36 @@ export function releaseDispatchLock(lock: DispatchLock): void {
   }
 }
 
+/**
+ * Test-only pause points for crash drills (tmux-recovery docs/pi-auto-continue.md §6.2). A point
+ * is active when `PI_TMUX_CONTINUE_TEST_PAUSE_AT` names it or the file `<ledger>/.test-pause-at`
+ * contains its name; the ledger directory is private to the user (0700). The executor then
+ * records `<ledger>/.test-reached-<name>` with its pid and blocks synchronously, so the drill can
+ * kill the process exactly there, until `<ledger>/.test-release-<name>` exists, at most 120 s.
+ */
+export function testCheckpoint(ledgerDir: string, name: string, env: NodeJS.ProcessEnv = process.env): void {
+  let active = env.PI_TMUX_CONTINUE_TEST_PAUSE_AT === name;
+  if (!active) {
+    try {
+      active = readFileSync(join(ledgerDir, ".test-pause-at"), "utf8").trim() === name;
+    } catch {
+      return;
+    }
+  }
+  if (!active) return;
+  writeFileSync(join(ledgerDir, `.test-reached-${name}`), `${JSON.stringify({ pid: process.pid, atMs: Date.now() })}\n`);
+  const release = join(ledgerDir, `.test-release-${name}`);
+  const deadline = Date.now() + 120_000;
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(release) && Date.now() < deadline) {
+    try {
+      Atomics.wait(cell, 0, 0, 100);
+    } catch {
+      execFileSync("sleep", ["0.1"]);
+    }
+  }
+}
+
 export function lastDispatchMs(ledgerDir: string): number | null {
   try {
     const value = JSON.parse(readFileSync(join(ledgerDir, ".last-dispatch"), "utf8"));

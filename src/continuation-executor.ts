@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 import {
   CONTINUE_CUSTOM_TYPE, acquireDispatchLock, continuationMessage, createExclusive, decide, lastDispatchMs,
-  lastMessageEntryId, readMode, readPlan, readyState, releaseDispatchLock, watchdogAlive, writeAtomicSync,
+  lastMessageEntryId, readMode, readPlan, readyState, releaseDispatchLock, testCheckpoint, watchdogAlive, writeAtomicSync,
   writeOutcome, writeSkip, type ContinuePlan, type LiveFacts,
 } from "./domain/continuation.ts";
 
@@ -214,6 +214,7 @@ export class ContinuationExecutor {
       return;
     }
     try {
+      testCheckpoint(this.plan.ledgerDir, "in-dispatch-lock");
       const claimPath = join(this.plan.ledgerDir, `${this.plan.key}.claim`);
       // The pre-check runs under the dispatch lock; the O_EXCL claim below
       // still decides if another holder claimed in between (reclaimed lock).
@@ -238,6 +239,7 @@ export class ContinuationExecutor {
         return;
       }
       this.claimed = true;
+      testCheckpoint(this.plan.ledgerDir, "after-claim");
       try {
         this.send(
           { customType: CONTINUE_CUSTOM_TYPE, content: continuationMessage(this.plan, now, this.continuationId), display: true, details: { continuationId: this.continuationId } },

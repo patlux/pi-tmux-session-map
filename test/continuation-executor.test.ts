@@ -7,7 +7,7 @@ import { after, test } from "node:test";
 import { ContinuationExecutor, type LiveSource } from "../src/continuation-executor.ts";
 import {
   acquireDispatchLock, continuationMessage, createExclusive, decide, lastMessageEntryId, releaseDispatchLock,
-  writeSkip, type ContinuePlan, type LiveFacts,
+  testCheckpoint, writeSkip, type ContinuePlan, type LiveFacts,
 } from "../src/domain/continuation.ts";
 
 const root = mkdtempSync(join(tmpdir(), "pi-continue-exec-"));
@@ -151,6 +151,20 @@ test("the last message entry ignores system and bookkeeping entries", () => {
   ]), "b");
   assert.equal(lastMessageEntryId([{ id: "m", type: "custom_message" }]), "m");
   assert.equal(lastMessageEntryId([]), null);
+});
+
+test("a test pause point is inert by default and blocks only while armed", () => {
+  const { ledgerDir } = fixture();
+  const started = Date.now();
+  testCheckpoint(ledgerDir, "after-claim", {});
+  assert.ok(Date.now() - started < 50, "inactive without env or file");
+  assert.equal(existsSync(join(ledgerDir, ".test-reached-after-claim")), false);
+  writeFileSync(join(ledgerDir, ".test-pause-at"), "after-claim\n");
+  testCheckpoint(ledgerDir, "in-dispatch-lock", {});
+  assert.equal(existsSync(join(ledgerDir, ".test-reached-in-dispatch-lock")), false, "only the named point");
+  writeFileSync(join(ledgerDir, ".test-release-after-claim"), "");
+  testCheckpoint(ledgerDir, "after-claim", {});
+  assert.equal(json(join(ledgerDir, ".test-reached-after-claim")).pid, process.pid);
 });
 
 // -- executor -----------------------------------------------------------------
