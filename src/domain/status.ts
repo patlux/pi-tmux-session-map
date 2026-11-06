@@ -36,6 +36,8 @@ export type ShutdownCause = "signal" | "quit" | "reload" | "replace";
 export type RecoveryEvidence = {
   runAnchor: RunAnchor | null;
   shutdownCause: ShutdownCause | null;
+  /** Auto-continue executor state for display (planned, admitted, skipped:<reason>, …). */
+  continueState?: string | null;
 };
 
 export type TwsStatusPayload = {
@@ -61,6 +63,7 @@ export type TwsStatusPayload = {
   // Additive recovery evidence for tmux-recovery's auto-continue decision.
   run_anchor: RunAnchor | null;
   shutdown_cause: ShutdownCause | null;
+  continue?: string;
 };
 
 export function buildTwsStatusPayload(
@@ -94,6 +97,7 @@ export function buildTwsStatusPayload(
     finished_at_ms: finishedAtMs,
     run_anchor: evidence.runAnchor,
     shutdown_cause: state === "shutdown" ? evidence.shutdownCause : null,
+    ...(evidence.continueState ? { continue: evidence.continueState } : {}),
   };
 }
 

@@ -1,0 +1,306 @@
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+
+import { ContinuationExecutor, type LiveSource } from "../src/continuation-executor.ts";
+import {
+  acquireDispatchLock, continuationMessage, createExclusive, decide, lastMessageEntryId, releaseDispatchLock,
+  writeSkip, type ContinuePlan, type LiveFacts,
+} from "../src/domain/continuation.ts";
+
+const root = mkdtempSync(join(tmpdir(), "pi-continue-exec-"));
+after(() => rmSync(root, { recursive: true, force: true }));
+let counter = 0;
+
+function fixture(overrides: Partial<ContinuePlan> = {}, ready = true) {
+  counter += 1;
+  const dir = join(root, `case-${counter}`);
+  const ledgerDir = join(dir, "ledger");
+  mkdirSync(ledgerDir, { recursive: true });
+  const plan: ContinuePlan = {
+    schema: 1, key: `key${counter}`, state: "released", chain: 1, token: `tok${counter}`, paneKey: "s:1.0",
+    sessionId: "sid", sessionFile: "/s.jsonl", frozenLeafId: "e4", interruptedAtMs: Date.now() - 14 * 86_400_000,
+    cause: "signal", toolCalls: [{ id: "call-1", name: "drill_block" }], ledgerDir, readyPath: join(dir, "ready.json"),
+    configPath: join(dir, "continue.json"), holdFile: join(dir, "hold"), spacingMs: 300, slotMs: Date.now(),
+    deadlineMs: Date.now() + 600_000, ...overrides,
+  };
+  const planPath = join(ledgerDir, `${plan.key}.json`);
+  writeFileSync(planPath, JSON.stringify(plan));
+  writeFileSync(plan.configPath, JSON.stringify({ mode: "on" }));
+  if (ready) {
+    writeFileSync(plan.readyPath, JSON.stringify({ tokens: { [plan.token]: { key: plan.key } } }));
+  }
+  return { plan, planPath, ledgerDir };
+}
+
+function live(overrides: Partial<Record<keyof LiveSource, unknown>> = {}): LiveSource {
+  const base: LiveSource = {
+    ackResumed: () => true,
+    paneKey: () => "s:1.0",
+    sessionId: () => "sid",
+    sessionFile: () => "/s.jsonl",
+    branch: () => [{ id: "e3", type: "message", message: { role: "user" } }, { id: "e4", type: "message", message: { role: "assistant" } }],
+    idle: () => true,
+    pendingMessages: () => false,
+    editorText: () => "",
+  };
+  return { ...base, ...(overrides as Partial<LiveSource>) };
+}
+
+type Sent = { message: { content: string; details: Record<string, unknown> }; at: number };
+
+function executor(planPath: string, source = live(), sent: Sent[] = [], send?: () => void) {
+  const env = { PI_TMUX_CONTINUE_PLAN: planPath, PI_TMUX_SESSION_WATCHDOG_ROOT: join(root, "no-watchdog") };
+  const created = ContinuationExecutor.fromEnvironment(
+    source,
+    (message) => {
+      send?.();
+      sent.push({ message: message as never, at: Date.now() });
+    },
+    () => undefined,
+    env,
+  );
+  assert.ok(created);
+  return created!;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const json = (path: string) => JSON.parse(readFileSync(path, "utf8"));
+
+// -- rules --------------------------------------------------------------------
+
+function facts(overrides: Partial<LiveFacts> = {}): LiveFacts {
+  return {
+    nowMs: 1000, ackResumed: true, sessionId: "sid", sessionFile: "/s.jsonl", paneKey: "s:1.0", lastMessageEntryId: "e4",
+    idle: true, pendingMessages: false, editorText: "", userActive: false, promptOpen: false, watchdogAlive: false,
+    mode: "on", holdPresent: false, ...overrides,
+  };
+}
+
+test("E1-E7 decide each case with its reason", () => {
+  const { plan } = fixture({ slotMs: 500, deadlineMs: 5000 });
+  const onDisk = plan;
+  assert.deepEqual(decide(plan, onDisk, facts(), false, null), { kind: "dispatch" });
+  const cases: [Partial<LiveFacts>, string][] = [
+    [{ ackResumed: false }, "ack"], [{ mode: "off" }, "disabled"], [{ holdPresent: true }, "hold"],
+    [{ sessionId: "other" }, "identity"], [{ paneKey: "x:1.0" }, "identity"], [{ lastMessageEntryId: "e5" }, "new-entry"],
+    [{ userActive: true }, "user-active"], [{ editorText: "draft" }, "user-active"], [{ promptOpen: true }, "user-active"],
+    [{ idle: false }, "busy"], [{ pendingMessages: true }, "busy"], [{ watchdogAlive: true }, "watchdog"],
+    [{ nowMs: 6000 }, "timeout"],
+  ];
+  for (const [override, reason] of cases) {
+    const verdict = decide(plan, onDisk, facts(override), false, null);
+    assert.equal(verdict.kind, "skip", reason);
+    assert.equal((verdict as { reason: string }).reason, reason);
+  }
+  assert.deepEqual(decide(plan, onDisk, facts({ nowMs: 400 }), false, null), { kind: "wait", untilMs: 500 });
+  assert.deepEqual(decide(plan, onDisk, facts(), false, 900), { kind: "wait", untilMs: 1200 }, "spacing from the last dispatch");
+  assert.deepEqual(decide(plan, onDisk, facts(), true, null), { kind: "stop", reason: "claimed" });
+  assert.deepEqual(decide(plan, { ...onDisk, state: "expired:ack" }, facts(), false, null), { kind: "stop", reason: "not-released" });
+  assert.deepEqual(decide(plan, { ...onDisk, token: "rebound" }, facts(), false, null), { kind: "stop", reason: "not-released" });
+});
+
+test("O_EXCL files: one claimant, the first skip wins, no skip after a claim", () => {
+  const { plan, ledgerDir } = fixture();
+  assert.equal(createExclusive(join(ledgerDir, "x.claim"), "a"), true);
+  assert.equal(createExclusive(join(ledgerDir, "x.claim"), "b"), false);
+  assert.equal(readFileSync(join(ledgerDir, "x.claim"), "utf8"), "a");
+  assert.equal(writeSkip(plan, "veto", "user-active"), true);
+  assert.equal(writeSkip(plan, "process-end", "session-ended"), false, "a veto is never downgraded");
+  assert.equal(json(join(ledgerDir, `${plan.key}.skip`)).class, "veto");
+  const other = fixture();
+  createExclusive(join(other.ledgerDir, `${other.plan.key}.claim`), "{}");
+  assert.equal(writeSkip(other.plan, "veto", "late"), false);
+});
+
+test("the dispatch lock admits one holder and is removed only by its owner", () => {
+  const { ledgerDir } = fixture();
+  const first = acquireDispatchLock(ledgerDir, "a");
+  assert.ok(first);
+  assert.equal(acquireDispatchLock(ledgerDir, "b"), undefined);
+  assert.equal(json(join(ledgerDir, "dispatch.lock")).continuationId, "a", "content is complete when the lock appears");
+  // a reconciler replaced the stale lock with a successor's lock
+  rmSync(join(ledgerDir, "dispatch.lock"));
+  const successor = acquireDispatchLock(ledgerDir, "c");
+  releaseDispatchLock(first!);
+  assert.ok(existsSync(join(ledgerDir, "dispatch.lock")), "the successor's lock survives");
+  releaseDispatchLock(successor!);
+  assert.equal(existsSync(join(ledgerDir, "dispatch.lock")), false);
+});
+
+test("the continuation message states the stop, the elapsed time and the open tool call", () => {
+  const { plan } = fixture();
+  const text = continuationMessage(plan, plan.interruptedAtMs! + 14 * 86_400_000, "cid-1");
+  assert.match(text, /^\[tmux-recovery\] Diese Session lief/);
+  assert.match(text, /vor 14 Tagen/);
+  assert.match(text, /`drill_block` \(call-1\)/);
+  assert.match(text, /Prüfe zuerst den tatsächlichen Stand/);
+  assert.match(text, /ist unbekannt/);
+  assert.match(text, /continuationId=cid-1$/);
+  assert.match(continuationMessage({ ...plan, toolCalls: [] }, plan.interruptedAtMs! + 30_000, "x"), /kein Werkzeugaufruf offen.*\n?/);
+});
+
+test("the last message entry ignores system and bookkeeping entries", () => {
+  assert.equal(lastMessageEntryId([
+    { id: "a", type: "message", message: { role: "user" } },
+    { id: "b", type: "message", message: { role: "assistant" } },
+    { id: "c", type: "context_edit" },
+    { id: "d", type: "message", message: { role: "system" } },
+  ]), "b");
+  assert.equal(lastMessageEntryId([{ id: "m", type: "custom_message" }]), "m");
+  assert.equal(lastMessageEntryId([]), null);
+});
+
+// -- executor -----------------------------------------------------------------
+
+test("a released plan is dispatched once, admitted and finished", async () => {
+  const { plan, planPath, ledgerDir } = fixture();
+  const sent: Sent[] = [];
+  const run = executor(planPath, live(), sent);
+  run.start();
+  await sleep(150);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]!.message.details.continuationId, run.continuationId);
+  const claim = json(join(ledgerDir, `${plan.key}.claim`));
+  assert.equal(claim.continuationId, run.continuationId);
+  assert.ok(existsSync(join(ledgerDir, ".last-dispatch")));
+  assert.equal(existsSync(join(ledgerDir, "dispatch.lock")), false, "the lock is released");
+  assert.equal(run.state(), "dispatched");
+  run.beforeAgentStart({ messageType: "custom", message: { customType: "tmux-recovery-continue", details: { continuationId: run.continuationId } } });
+  assert.equal(json(join(ledgerDir, `${plan.key}.outcome`)).outcome, "admitted");
+  run.agentSettled("done");
+  run.agentSettled("failed");
+  assert.equal(json(join(ledgerDir, `${plan.key}.outcome`)).outcome, "done", "only the continuation turn's outcome");
+  run.shutdown();
+  assert.equal(existsSync(join(ledgerDir, `${plan.key}.skip`)), false, "a claimed plan is never skipped");
+});
+
+test("user activity before the slot vetoes durably and nothing is sent", async () => {
+  const { plan, planPath, ledgerDir } = fixture({ slotMs: Date.now() + 300 });
+  const sent: Sent[] = [];
+  const run = executor(planPath, live(), sent);
+  run.start();
+  await sleep(50);
+  run.noteUserActivity();
+  await sleep(400);
+  assert.equal(sent.length, 0);
+  assert.equal(json(join(ledgerDir, `${plan.key}.skip`)).reason, "user-active");
+  run.shutdown();
+  assert.equal(json(join(ledgerDir, `${plan.key}.skip`)).class, "veto", "shutdown does not downgrade the veto");
+});
+
+test("another run before the dispatch is a veto; a session end is a process-end skip", async () => {
+  const busy = fixture({ slotMs: Date.now() + 300 });
+  const run = executor(busy.planPath);
+  run.start();
+  run.beforeAgentStart({ messageType: "user" });
+  assert.equal(json(join(busy.ledgerDir, `${busy.plan.key}.skip`)).reason, "busy");
+
+  const ended = fixture({ slotMs: Date.now() + 300 });
+  const other = executor(ended.planPath);
+  other.start();
+  other.shutdown();
+  const skip = json(join(ended.ledgerDir, `${ended.plan.key}.skip`));
+  assert.deepEqual([skip.class, skip.reason], ["process-end", "session-ended"]);
+});
+
+test("a ready.json without this token stops without sending", async () => {
+  const { plan, planPath, ledgerDir } = fixture({}, false);
+  writeFileSync(plan.readyPath, JSON.stringify({ tokens: {} }));
+  const sent: Sent[] = [];
+  const run = executor(planPath, live(), sent);
+  run.start();
+  await sleep(100);
+  assert.equal(sent.length, 0);
+  assert.equal(json(join(ledgerDir, `${plan.key}.skip`)).reason, "not-released");
+});
+
+test("two executors of one key send once; executors of two keys keep the spacing", async () => {
+  const shared = fixture();
+  const sent: Sent[] = [];
+  const a = executor(shared.planPath, live(), sent);
+  const b = executor(shared.planPath, live(), sent);
+  a.start();
+  b.start();
+  // past the spacing (300 ms) and several lock retries: the second executor
+  // must stop at the claim, not merely wait for its slot
+  await sleep(1500);
+  assert.equal(sent.length, 1, "one claim per key");
+  assert.deepEqual([a.state(), b.state()].sort(), ["dispatched", "stopped:claimed"]);
+
+  const first = fixture();
+  const second = fixture({ ledgerDir: first.ledgerDir });
+  writeFileSync(join(first.ledgerDir, `${second.plan.key}.json`), JSON.stringify({ ...second.plan, ledgerDir: first.ledgerDir }));
+  const spaced: Sent[] = [];
+  const x = executor(first.planPath, live(), spaced);
+  const y = executor(join(first.ledgerDir, `${second.plan.key}.json`), live(), spaced);
+  x.start();
+  y.start();
+  await sleep(900);
+  assert.equal(spaced.length, 2);
+  assert.ok(spaced[1]!.at - spaced[0]!.at >= first.plan.spacingMs - 5, `gap ${spaced[1]!.at - spaced[0]!.at} ms`);
+});
+
+test("a claim taken after the pre-check wins over this executor (O_EXCL)", async () => {
+  const { plan, planPath, ledgerDir } = fixture();
+  const claimPath = join(ledgerDir, `${plan.key}.claim`);
+  const sent: Sent[] = [];
+  // the live facts are read after the pre-check: another holder claims here
+  const race = live({
+    idle: () => {
+      if (!existsSync(claimPath)) writeFileSync(claimPath, JSON.stringify({ continuationId: "other" }));
+      return true;
+    },
+  });
+  const run = executor(planPath, race, sent);
+  run.start();
+  await sleep(150);
+  assert.equal(sent.length, 0);
+  assert.equal(run.state(), "stopped:claimed");
+  assert.equal(json(claimPath).continuationId, "other", "the foreign claim is untouched");
+});
+
+test("a busy dispatch lock is retried, never stolen", async () => {
+  const { planPath, ledgerDir } = fixture();
+  writeFileSync(join(ledgerDir, "dispatch.lock"), JSON.stringify({ pid: 1, continuationId: "other" }));
+  const sent: Sent[] = [];
+  const run = executor(planPath, live(), sent);
+  run.start();
+  await sleep(300);
+  assert.equal(sent.length, 0);
+  assert.equal(json(join(ledgerDir, "dispatch.lock")).continuationId, "other");
+  rmSync(join(ledgerDir, "dispatch.lock"));
+  await sleep(1200);
+  assert.equal(sent.length, 1);
+});
+
+test("a throwing send leaves an uncertain outcome and releases the lock", async () => {
+  const { plan, planPath, ledgerDir } = fixture();
+  const run = executor(planPath, live(), [], () => {
+    throw new Error("boom");
+  });
+  run.start();
+  await sleep(150);
+  assert.equal(json(join(ledgerDir, `${plan.key}.outcome`)).outcome, "uncertain");
+  assert.ok(existsSync(join(ledgerDir, `${plan.key}.claim`)), "the claim stays: never resent");
+  assert.equal(existsSync(join(ledgerDir, "dispatch.lock")), false);
+});
+
+test("a new message entry or an unknown acknowledgement prevents the dispatch", async () => {
+  const moved = fixture();
+  const sent: Sent[] = [];
+  executor(moved.planPath, live({ branch: () => [{ id: "e9", type: "message", message: { role: "user" } }] }), sent).start();
+  await sleep(150);
+  assert.equal(sent.length, 0);
+  assert.equal(json(join(moved.ledgerDir, `${moved.plan.key}.skip`)).reason, "new-entry");
+
+  const pending = fixture();
+  const waiting = executor(pending.planPath, live({ ackResumed: () => undefined }), sent);
+  waiting.start();
+  await sleep(150);
+  assert.equal(sent.length, 0);
+  assert.equal(waiting.state(), "planned", "waits while the acknowledgement is pending");
+  waiting.shutdown();
+});

@@ -13,6 +13,7 @@ import { parsePaneInfoOutput, parseZellijPaneInfo, mexPaneInfo } from "./domain/
 import { ownsInteractivePane, paneOwnershipEvidence } from "./domain/pane-ownership.ts";
 import { buildRestoreAck, restoreAckPath, restoreExpectationFromEnvironment, serializeRestoreAck } from "./domain/restore-ack.ts";
 import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
+import { ContinuationExecutor } from "./continuation-executor.ts";
 import { createSignalEvidenceListener, recordedTerminationSignal } from "./domain/signal-evidence.ts";
 import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type RecoveryEvidence, type RunAnchor, type SessionInfo, type ShutdownCause } from "./domain/status.ts";
 
@@ -74,6 +75,10 @@ type ArtifactCache = {
   pendingRestoreReason: string | null;
   /** Anchor of the current agent run; null outside a run. */
   runAnchor: RunAnchor | null;
+  /** In-process status of the restore acknowledgement, once known. */
+  restoreAckStatus: "resumed" | "mismatch" | undefined;
+  /** Auto-continue executor state for the status sidecar. */
+  continueState: () => string | null;
 };
 
 export function shutdownCauseFor(reason: string, signal: string | null): ShutdownCause {
@@ -238,14 +243,15 @@ async function writeRestoreAcknowledgement(
   session: SessionInfo,
   sessionId: string,
   reason: string,
-): Promise<void> {
+): Promise<"resumed" | "mismatch" | undefined> {
   const expectation = restoreExpectationFromEnvironment();
   if (!expectation) {
-    return;
+    return undefined;
   }
   const ack = buildRestoreAck(expectation, info, session, sessionId, reason, Date.now());
   await ensureDirectory(expectation.ackDir);
   await writeAtomicExclusive(restoreAckPath(expectation), serializeRestoreAck(ack), 0o600);
+  return ack.status;
 }
 
 /** Resolve pane info for a pending restore acknowledgement, with growing timeouts. */
@@ -359,7 +365,7 @@ async function applyEventAction(
   if (artifactCache.pendingRestoreReason !== null && info.backend === "tmux") {
     // Acknowledge before the mapping: the restore only waits for this file,
     // and a mapping failure must not suppress it.
-    await writeRestoreAcknowledgement(info, session, sessionId, artifactCache.pendingRestoreReason);
+    artifactCache.restoreAckStatus = await writeRestoreAcknowledgement(info, session, sessionId, artifactCache.pendingRestoreReason);
     artifactCache.pendingRestoreReason = null;
   }
 
@@ -395,6 +401,7 @@ async function applyEventAction(
     artifactCache.runAnchor = null;
   }
   const evidence: RecoveryEvidence = {
+    continueState: artifactCache.continueState(),
     runAnchor: artifactCache.runAnchor,
     shutdownCause: action.shutdownReason === undefined
       ? null
@@ -441,8 +448,11 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     statusSignature: null,
     pendingRestoreReason: null,
     runAnchor: null,
+    restoreAckStatus: undefined,
+    continueState: () => executor?.state() ?? null,
   };
   const signalEvidence = createSignalEvidenceListener();
+  let executor: ContinuationExecutor | undefined;
 
   const enqueue = async (ctx: ExtensionContext, action: EventAction) => {
     await queue.enqueue(async () => {
@@ -514,10 +524,58 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     });
     // Only the visible interactive Pi owns the pane; print, RPC and headless
     // children never install a signal listener.
-    if (ownsInteractivePane(paneOwnershipEvidence(ctx.mode, process.stdin.isTTY))) {
+    const ownsPane = ownsInteractivePane(paneOwnershipEvidence(ctx.mode, process.stdin.isTTY));
+    if (ownsPane) {
       signalEvidence.install();
     }
+    // Auto-continue executor: only the restored Pi that the restore engine
+    // planned (PI_TMUX_CONTINUE_PLAN), once, at its startup.
+    if (ownsPane && event.reason === "startup" && executor === undefined && process.env.TMUX) {
+      executor = ContinuationExecutor.fromEnvironment(
+        {
+          ackResumed: () => (artifactCache.restoreAckStatus === undefined ? undefined : artifactCache.restoreAckStatus === "resumed"),
+          paneKey: () => artifactCache.paneInfo?.paneKey ?? null,
+          sessionId: () => ctx.sessionManager.getSessionId(),
+          sessionFile: () => ctx.sessionManager.getSessionFile() ?? null,
+          branch: () => ctx.sessionManager.getBranch() as never,
+          idle: () => ctx.isIdle(),
+          pendingMessages: () => ctx.hasPendingMessages(),
+          editorText: () => ctx.ui.getEditorText() ?? "",
+        },
+        (message, options) => pi.sendMessage(message, options),
+        () => {
+          void enqueue(ctx, { mapping: false, status: "refresh" });
+        },
+      );
+      if (executor) {
+        // Any keystroke before the dispatch vetoes it (terminal replies do not
+        // reach this listener inside tmux; measured in tmux-recovery phase 0).
+        ctx.ui.onTerminalInput(() => {
+          executor?.noteUserActivity();
+          return undefined;
+        });
+        executor.start();
+      }
+    }
     startReconciliation(ctx);
+  });
+  pi.on("input", (event) => {
+    if (event.source !== "extension") {
+      executor?.noteUserActivity();
+    }
+    return undefined;
+  });
+  // Pi 1.5 emits ui_prompt_start/end around extension dialogs; older Pi never does.
+  const onUiPrompt = pi.on as unknown as (event: string, handler: () => void) => void;
+  onUiPrompt("ui_prompt_start", () => {
+    executor?.notePrompt(true);
+  });
+  onUiPrompt("ui_prompt_end", () => {
+    executor?.notePrompt(false);
+  });
+  pi.on("before_agent_start", (event) => {
+    executor?.beforeAgentStart(event as never);
+    return undefined;
   });
   pi.on("session_info_changed", async (_event, ctx) => {
     await enqueue(ctx, { mapping: true, status: "refresh", refreshPane: true });
@@ -542,10 +600,12 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     });
   });
   pi.on("agent_settled", async (_event, ctx) => {
+    executor?.agentSettled(pendingFinalState);
     await enqueue(ctx, { mapping: true, status: pendingFinalState });
   });
   pi.on("session_shutdown", async (event, ctx) => {
     stopReconciliation();
+    executor?.shutdown();
     if (event.reason !== "quit") {
       // A replacement instance installs its own listener; a quit keeps it so a
       // signal that arrives during the shutdown is still recorded.

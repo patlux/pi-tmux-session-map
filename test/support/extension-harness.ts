@@ -12,8 +12,15 @@ export type FakeSession = {
   id: string;
   file: string;
   leafId: string | null;
+  branch: Record<string, unknown>[];
+  idle: boolean;
+  editorText: string;
+  /** Handlers registered through ctx.ui.onTerminalInput. */
+  terminalInput: ((data: string) => unknown)[];
   ctx: Record<string, unknown>;
 };
+
+export type SentMessage = { message: Record<string, unknown>; options: Record<string, unknown> | undefined };
 
 export async function loadExtensionHarness(paneKey = "tws_fixture_main:1.0") {
   const root = mkdtempSync(join(tmpdir(), "pi-tmux-ext-"));
@@ -53,9 +60,12 @@ printf '${paneKey}\\t${session}\\t${window}\\t${pane}\\t4242\\n'
     setTmuxFailures(count: number) {
       writeFileSync(failures, String(count));
     },
-    loadExtension(): Record<string, Handler> {
+    loadExtension(sent: SentMessage[] = []): Record<string, Handler> {
       const handlers: Record<string, Handler> = {};
-      module.default({ on: (name: string, handler: Handler) => { handlers[name] = handler; } } as never);
+      module.default({
+        on: (name: string, handler: Handler) => { handlers[name] = handler; },
+        sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => { sent.push({ message, options }); },
+      } as never);
       return handlers;
     },
     session(id: string): FakeSession {
@@ -65,6 +75,10 @@ printf '${paneKey}\\t${session}\\t${window}\\t${pane}\\t4242\\n'
         id,
         file,
         leafId: null,
+        branch: [],
+        idle: true,
+        editorText: "",
+        terminalInput: [],
         ctx: {},
       };
       fake.ctx = {
@@ -75,6 +89,16 @@ printf '${paneKey}\\t${session}\\t${window}\\t${pane}\\t4242\\n'
           getSessionName: () => "Fixture",
           getSessionId: () => id,
           getLeafId: () => fake.leafId,
+          getBranch: () => fake.branch,
+        },
+        isIdle: () => fake.idle,
+        hasPendingMessages: () => false,
+        ui: {
+          getEditorText: () => fake.editorText,
+          onTerminalInput: (handler: (data: string) => unknown) => {
+            fake.terminalInput.push(handler);
+            return () => undefined;
+          },
         },
       };
       return fake;
@@ -85,6 +109,14 @@ printf '${paneKey}\\t${session}\\t${window}\\t${pane}\\t4242\\n'
         throw new Error(`expected one status file, found ${files.length}`);
       }
       return JSON.parse(readFileSync(join(root, "tws", "pi-status", files[0]!), "utf8"));
+    },
+    readStatusFor(sessionId: string): Record<string, unknown> {
+      const dir = join(root, "tws", "pi-status");
+      for (const name of readdirSync(dir).filter((entry: string) => entry.endsWith(".json"))) {
+        const status = JSON.parse(readFileSync(join(dir, name), "utf8"));
+        if (status.session_id === sessionId) return status;
+      }
+      throw new Error(`no status file for ${sessionId}`);
     },
     cleanup() {
       rmSync(root, { recursive: true, force: true });
