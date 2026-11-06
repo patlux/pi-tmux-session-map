@@ -276,6 +276,39 @@ test("a claim taken after the pre-check wins over this executor (O_EXCL)", async
   assert.equal(json(claimPath).continuationId, "other", "the foreign claim is untouched");
 });
 
+test("the dispatch lock is held while the message is sent", async () => {
+  const { planPath, ledgerDir } = fixture();
+  let probe: unknown = "not sent";
+  const run = executor(planPath, live(), [], () => {
+    // another executor trying to dispatch right now must find the lock taken
+    probe = acquireDispatchLock(ledgerDir, "probe");
+  });
+  run.start();
+  await sleep(150);
+  assert.equal(probe, undefined, "the lock was free during the send");
+  assert.equal(existsSync(join(ledgerDir, "dispatch.lock")), false, "released afterwards");
+});
+
+test("a veto that arrives during the dispatch section cannot interleave with it", async () => {
+  const { plan, planPath, ledgerDir } = fixture();
+  const sent: Sent[] = [];
+  let run: ContinuationExecutor | undefined;
+  // the activity is queued while the rules are checked; it may only run after the section
+  const racing = live({
+    idle: () => {
+      queueMicrotask(() => run?.noteUserActivity());
+      return true;
+    },
+  });
+  run = executor(planPath, racing, sent);
+  run.start();
+  await sleep(150);
+  const claimed = existsSync(join(ledgerDir, `${plan.key}.claim`));
+  const vetoed = existsSync(join(ledgerDir, `${plan.key}.skip`));
+  assert.ok(claimed !== vetoed, `claim and veto both or neither: claim=${claimed} veto=${vetoed}`);
+  assert.equal(sent.length, claimed ? 1 : 0);
+});
+
 test("a busy dispatch lock is retried, never stolen", async () => {
   const { planPath, ledgerDir } = fixture();
   writeFileSync(join(ledgerDir, "dispatch.lock"), JSON.stringify({ pid: 1, continuationId: "other" }));
