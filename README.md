@@ -128,9 +128,12 @@ Optional environment variables for hardening or local integration:
 - `PI_TMUX_SESSION_MAP_TWS_STATUS_DIR` — override only the tws status directory.
 - `PI_TMUX_SESSION_MAP_TWS_TRIGGER_FILE` — override the tws trigger file.
 - `PI_TMUX_SESSION_MAP_TMUX_BIN` — override the `tmux` binary path.
+- `PI_TMUX_SESSION_MAP_RESTORE_PANE_TIMEOUTS_MS` — comma-separated `tmux display-message` timeouts while a restore acknowledgement is pending; default `1000,2000,4000,8000,16000`.
 - `PI_TMUX_SESSION_MAP_RECONCILE_INTERVAL_MS` — periodic mapping reconciliation interval; minimum 10 seconds, default 60 seconds, deterministically jittered per pane.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_BIN` — override the `zellij` binary path.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_STATUS_DIR` — override the Zellij TWS status directory.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_TRIGGER_FILE` — override the Zellij TWS trigger file.
+
+A restore acknowledgement (`PI_TMUX_RESTORE_*` environment from `pi-tmux-resume`) is written at most once per token: the first writer wins, so a later `/new` or `/reload` cannot replace the proof of what the restore resumed. A restore keeps the tmux server busy, so while the acknowledgement is pending the pane lookup is retried with growing timeouts; if every attempt fails, the next lifecycle event or reconciliation writes it.
 
 Lifecycle sidecar updates are serialized in-process, mapping and status files are written atomically, and `tmux display-message` is bounded by a short timeout so Pi lifecycle hooks do not hang indefinitely.

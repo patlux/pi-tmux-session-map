@@ -4,7 +4,7 @@ import { open, utimes } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic } from "./domain/atomic-write.ts";
+import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic, writeAtomicExclusive } from "./domain/atomic-write.ts";
 import { createAsyncQueue } from "./domain/async-queue.ts";
 import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
 import { publishSessionMapping } from "./domain/mapping-publisher.ts";
@@ -15,9 +15,9 @@ import { buildRestoreAck, restoreAckPath, restoreExpectationFromEnvironment, ser
 import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
 import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type SessionInfo } from "./domain/status.ts";
 
-function execFileAsync(file: string, args: readonly string[]): Promise<{ stdout: string }> {
+function execFileAsync(file: string, args: readonly string[], timeoutMs = muxTimeoutMs): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { timeout: muxTimeoutMs }, (error, stdout) => {
+    execFile(file, args, { timeout: timeoutMs }, (error, stdout) => {
       if (error) {
         reject(error);
         return;
@@ -33,6 +33,16 @@ const twsTriggerFile = process.env.PI_TMUX_SESSION_MAP_TWS_TRIGGER_FILE ?? join(
 const tmuxBin = process.env.PI_TMUX_SESSION_MAP_TMUX_BIN ?? "tmux";
 const zellijBin = process.env.PI_TMUX_SESSION_MAP_ZELLIJ_BIN ?? "zellij";
 const muxTimeoutMs = 1000;
+// A restore recreates many panes at once and keeps the tmux server busy, so a
+// 1 s `display-message` can time out exactly when a restored Pi starts. Without
+// pane info the one-shot restore acknowledgement was never written (observed in
+// a 106-session Tart drill on 2026-11-06). While that acknowledgement is
+// pending, retry with growing timeouts; about 31 s in total, below the restore
+// engine's minimum acknowledgement window of 15 s + 2 s per resumed pane.
+const restorePaneInfoTimeoutsMs = (process.env.PI_TMUX_SESSION_MAP_RESTORE_PANE_TIMEOUTS_MS ?? "1000,2000,4000,8000,16000")
+  .split(",")
+  .map((value) => Number.parseInt(value, 10))
+  .filter((value) => Number.isFinite(value) && value > 0);
 const cleanupMaxAgeMs = 24 * 60 * 60 * 1000;
 const reconcileIntervalMs = Math.max(
   10_000,
@@ -55,6 +65,8 @@ type ArtifactCache = {
   paneInfoResolved: boolean;
   mappingSignature: string | null;
   statusSignature: string | null;
+  /** session_start reason of a restore acknowledgement not yet written. */
+  pendingRestoreReason: string | null;
 };
 
 type AgentEndMessage = {
@@ -86,13 +98,14 @@ export function provisionalWorkState(finalState: FinalWorkState): WorkState {
   return finalState === "failed" ? "retrying" : finalState;
 }
 
-export async function resolvePaneInfo(): Promise<PaneInfo | undefined> {
+export async function resolvePaneInfo(timeoutMs = muxTimeoutMs): Promise<PaneInfo | undefined> {
   const tmuxPane = process.env.TMUX_PANE;
   if (process.env.TMUX && tmuxPane) {
     try {
       const { stdout } = await execFileAsync(
         tmuxBin,
         ["display-message", "-p", "-t", tmuxPane, PANE_INFO_FORMAT],
+        timeoutMs,
       );
       return parsePaneInfoOutput(stdout, tmuxPane);
     } catch {
@@ -194,6 +207,11 @@ async function writeSessionMapping(info: PaneInfo, session: SessionInfo, session
   return (await publishSessionMapping(stateDir, info, session, sessionId)) !== undefined;
 }
 
+/**
+ * Publish the one-shot restore acknowledgement. The first acknowledgement for a
+ * token wins: a later session_start in the same process (for example after
+ * /new or /reload) must not replace the proof of what the restore resumed.
+ */
 async function writeRestoreAcknowledgement(
   info: PaneInfo,
   session: SessionInfo,
@@ -206,7 +224,21 @@ async function writeRestoreAcknowledgement(
   }
   const ack = buildRestoreAck(expectation, info, session, sessionId, reason, Date.now());
   await ensureDirectory(expectation.ackDir);
-  await writeAtomic(restoreAckPath(expectation), serializeRestoreAck(ack), 0o600);
+  await writeAtomicExclusive(restoreAckPath(expectation), serializeRestoreAck(ack), 0o600);
+}
+
+/** Resolve pane info for a pending restore acknowledgement, with growing timeouts. */
+async function resolvePaneInfoForRestore(): Promise<PaneInfo | undefined> {
+  for (const [attempt, timeoutMs] of restorePaneInfoTimeoutsMs.entries()) {
+    const info = await resolvePaneInfo(timeoutMs);
+    if (info) {
+      return info;
+    }
+    if (attempt + 1 < restorePaneInfoTimeoutsMs.length) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  return undefined;
 }
 
 function getSessionInfo(ctx: ExtensionContext): SessionInfo {
@@ -286,24 +318,33 @@ async function applyEventAction(
     return runtimeState;
   }
 
-  if (action.refreshPane === true || !artifactCache.paneInfoResolved) {
-    artifactCache.paneInfo = await resolvePaneInfo();
+  if (action.restoreReason !== undefined && restoreExpectationFromEnvironment() !== undefined) {
+    artifactCache.pendingRestoreReason = action.restoreReason;
+  }
+  const restorePending = artifactCache.pendingRestoreReason !== null;
+  if (action.refreshPane === true || !artifactCache.paneInfoResolved || (restorePending && !artifactCache.paneInfo)) {
+    artifactCache.paneInfo = restorePending ? await resolvePaneInfoForRestore() : await resolvePaneInfo();
     artifactCache.paneInfoResolved = true;
   }
   const info = artifactCache.paneInfo;
   if (!info) {
+    // A pending restore acknowledgement stays pending; the next event or the
+    // periodic reconciliation retries it.
     return runtimeState;
   }
 
   const sessionId = ctx.sessionManager.getSessionId();
+  if (artifactCache.pendingRestoreReason !== null && info.backend === "tmux") {
+    // Acknowledge before the mapping: the restore only waits for this file,
+    // and a mapping failure must not suppress it.
+    await writeRestoreAcknowledgement(info, session, sessionId, artifactCache.pendingRestoreReason);
+    artifactCache.pendingRestoreReason = null;
+  }
+
   const mappingSignature = sessionMappingSignature(info, session, sessionId);
   if (mappingSessionFile !== null && mappingSignature !== null && mappingSignature !== artifactCache.mappingSignature) {
     const published = await writeSessionMapping(info, session, sessionId);
     artifactCache.mappingSignature = published ? mappingSignature : null;
-  }
-
-  if (action.restoreReason !== undefined && info.backend === "tmux") {
-    await writeRestoreAcknowledgement(info, session, sessionId, action.restoreReason);
   }
 
   if (action.status === null) {
@@ -358,6 +399,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     paneInfoResolved: false,
     mappingSignature: null,
     statusSignature: null,
+    pendingRestoreReason: null,
   };
 
   const enqueue = async (ctx: ExtensionContext, action: EventAction) => {
@@ -418,6 +460,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     artifactCache.paneInfoResolved = false;
     artifactCache.mappingSignature = null;
     artifactCache.statusSignature = null;
+    artifactCache.pendingRestoreReason = null;
     runtimeState = createRuntimeState();
     await enqueue(ctx, {
       mapping: true,
@@ -458,6 +501,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     artifactCache.paneInfoResolved = false;
     artifactCache.mappingSignature = null;
     artifactCache.statusSignature = null;
+    artifactCache.pendingRestoreReason = null;
     runtimeState = createRuntimeState();
   });
 }

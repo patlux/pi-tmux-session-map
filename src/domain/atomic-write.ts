@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import { mappedPaneIdentity, mappedSessionFile } from "./session-mapping.ts";
@@ -30,6 +30,28 @@ export async function writeAtomic(file: string, data: string, mode: number): Pro
     if (!renamed) {
       await rm(tmp, { force: true });
     }
+  }
+}
+
+/**
+ * Publish `file` with its complete content only if it does not exist yet.
+ * Returns false when another writer published it first; its content is kept.
+ */
+export async function writeAtomicExclusive(file: string, data: string, mode: number): Promise<boolean> {
+  const tmp = nextTempPath(file);
+  try {
+    await writeFile(tmp, data, { mode });
+    try {
+      await link(tmp, file);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        return false;
+      }
+      throw error;
+    }
+  } finally {
+    await rm(tmp, { force: true });
   }
 }
 
