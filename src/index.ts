@@ -13,7 +13,8 @@ import { parsePaneInfoOutput, parseZellijPaneInfo, mexPaneInfo } from "./domain/
 import { ownsInteractivePane, paneOwnershipEvidence } from "./domain/pane-ownership.ts";
 import { buildRestoreAck, restoreAckPath, restoreExpectationFromEnvironment, serializeRestoreAck } from "./domain/restore-ack.ts";
 import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
-import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type SessionInfo } from "./domain/status.ts";
+import { createSignalEvidenceListener, recordedTerminationSignal } from "./domain/signal-evidence.ts";
+import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type RecoveryEvidence, type RunAnchor, type SessionInfo, type ShutdownCause } from "./domain/status.ts";
 
 function execFileAsync(file: string, args: readonly string[], timeoutMs = muxTimeoutMs): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
@@ -58,6 +59,10 @@ type EventAction = {
   cleanup?: boolean;
   restoreReason?: string;
   refreshPane?: boolean;
+  /** Leaf captured synchronously at agent_start, before the prompt is persisted. */
+  runStartLeafId?: string | null;
+  /** session_shutdown reason; the cause is resolved when the payload is built. */
+  shutdownReason?: string;
 };
 
 type ArtifactCache = {
@@ -67,7 +72,20 @@ type ArtifactCache = {
   statusSignature: string | null;
   /** session_start reason of a restore acknowledgement not yet written. */
   pendingRestoreReason: string | null;
+  /** Anchor of the current agent run; null outside a run. */
+  runAnchor: RunAnchor | null;
 };
+
+export function shutdownCauseFor(reason: string, signal: string | null): ShutdownCause {
+  switch (reason) {
+    case "quit":
+      return signal === null ? "quit" : "signal";
+    case "reload":
+      return "reload";
+    default:
+      return "replace";
+  }
+}
 
 type AgentEndMessage = {
   role: string;
@@ -184,8 +202,11 @@ export function twsStatusSignature(
   startedAtMs: number | null,
   finishedAtMs: number | null,
   sessionId: string,
+  evidence: RecoveryEvidence = { runAnchor: null, shutdownCause: null },
 ): string {
   return JSON.stringify([
+    evidence.runAnchor,
+    evidence.shutdownCause,
     info.backend,
     info.paneKey,
     info.paneId,
@@ -280,9 +301,10 @@ async function writeTwsStatus(
   startedAtMs: number | null,
   finishedAtMs: number | null,
   sessionId: string,
+  evidence: RecoveryEvidence,
 ): Promise<void> {
   const payload = buildTwsStatusPayload(info, session, state, updatedAtMs, startedAtMs, finishedAtMs,
-    { sessionId, piPid: process.pid });
+    { sessionId, piPid: process.pid }, evidence);
 
   const directory = statusDirectory(info);
   const fileName = statusFileName(info.paneKey);
@@ -362,6 +384,23 @@ async function applyEventAction(
     return transition;
   }
 
+  // A run starts on the first `working` after a non-running state; retries keep
+  // the anchor. Final states and idle end the run.
+  if (transition.state === "working" && runtimeState.lastState !== "working" && runtimeState.lastState !== "retrying") {
+    artifactCache.runAnchor = {
+      leaf_id: action.runStartLeafId ?? null,
+      started_at_ms: transition.startedAtMs ?? now,
+    };
+  } else if (transition.state !== "working" && transition.state !== "retrying" && transition.state !== "shutdown") {
+    artifactCache.runAnchor = null;
+  }
+  const evidence: RecoveryEvidence = {
+    runAnchor: artifactCache.runAnchor,
+    shutdownCause: action.shutdownReason === undefined
+      ? null
+      : shutdownCauseFor(action.shutdownReason, recordedTerminationSignal()),
+  };
+
   const statusSignature = twsStatusSignature(
     info,
     session,
@@ -369,12 +408,13 @@ async function applyEventAction(
     transition.startedAtMs,
     transition.finishedAtMs,
     sessionId,
+    evidence,
   );
   if (statusSignature === artifactCache.statusSignature) {
     return transition;
   }
 
-  await writeTwsStatus(info, session, transition.state, now, transition.startedAtMs, transition.finishedAtMs, sessionId);
+  await writeTwsStatus(info, session, transition.state, now, transition.startedAtMs, transition.finishedAtMs, sessionId, evidence);
   artifactCache.statusSignature = statusSignature;
   return transition;
 }
@@ -400,7 +440,9 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     mappingSignature: null,
     statusSignature: null,
     pendingRestoreReason: null,
+    runAnchor: null,
   };
+  const signalEvidence = createSignalEvidenceListener();
 
   const enqueue = async (ctx: ExtensionContext, action: EventAction) => {
     await queue.enqueue(async () => {
@@ -461,6 +503,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     artifactCache.mappingSignature = null;
     artifactCache.statusSignature = null;
     artifactCache.pendingRestoreReason = null;
+    artifactCache.runAnchor = null;
     runtimeState = createRuntimeState();
     await enqueue(ctx, {
       mapping: true,
@@ -469,6 +512,11 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
       restoreReason: event.reason,
       refreshPane: true,
     });
+    // Only the visible interactive Pi owns the pane; print, RPC and headless
+    // children never install a signal listener.
+    if (ownsInteractivePane(paneOwnershipEvidence(ctx.mode, process.stdin.isTTY))) {
+      signalEvidence.install();
+    }
     startReconciliation(ctx);
   });
   pi.on("session_info_changed", async (_event, ctx) => {
@@ -476,7 +524,9 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
   });
   pi.on("agent_start", async (_event, ctx) => {
     pendingFinalState = "done";
-    await enqueue(ctx, { mapping: true, status: "working", refreshPane: true });
+    // Read the leaf now: the run's prompt entry is persisted after agent_start.
+    const runStartLeafId = ctx.sessionManager.getLeafId() ?? null;
+    await enqueue(ctx, { mapping: true, status: "working", refreshPane: true, runStartLeafId });
   });
   // agent_end may be followed by automatic retry/compaction. Keep failures
   // provisional until agent_settled confirms that no continuation will run.
@@ -494,14 +544,20 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     await enqueue(ctx, { mapping: true, status: pendingFinalState });
   });
-  pi.on("session_shutdown", async (_event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     stopReconciliation();
-    await enqueue(ctx, { mapping: false, status: "shutdown" });
+    if (event.reason !== "quit") {
+      // A replacement instance installs its own listener; a quit keeps it so a
+      // signal that arrives during the shutdown is still recorded.
+      signalEvidence.uninstall();
+    }
+    await enqueue(ctx, { mapping: false, status: "shutdown", shutdownReason: event.reason });
     artifactCache.paneInfo = undefined;
     artifactCache.paneInfoResolved = false;
     artifactCache.mappingSignature = null;
     artifactCache.statusSignature = null;
     artifactCache.pendingRestoreReason = null;
+    artifactCache.runAnchor = null;
     runtimeState = createRuntimeState();
   });
 }

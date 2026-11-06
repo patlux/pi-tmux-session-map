@@ -45,6 +45,8 @@ test("buildTwsStatusPayload maps pane and session metadata", () => {
     updated_at_ms: 2000,
     started_at_ms: 1000,
     finished_at_ms: 2000,
+    run_anchor: null,
+    shutdown_cause: null,
   });
 });
 
@@ -90,6 +92,8 @@ test("buildTwsStatusPayload maps mex pane metadata", () => {
     updated_at_ms: 3000,
     started_at_ms: 1000,
     finished_at_ms: null,
+    run_anchor: null,
+    shutdown_cause: null,
   });
 });
 
@@ -123,4 +127,15 @@ test("serializeStatusPayload emits newline-terminated JSON", () => {
   const serialized = serializeStatusPayload(payload);
   assert.equal(serialized.endsWith("\n"), true);
   assert.deepEqual(JSON.parse(serialized), payload);
+});
+
+test("buildTwsStatusPayload publishes recovery evidence and the cause only for shutdown", () => {
+  const pane = { backend: "tmux" as const, paneKey: "p:1.0", paneId: "%1", tmuxServerPid: "7", sessionName: "p", windowIndex: 1, paneIndex: 0 };
+  const session = { cwd: "/tmp", sessionFile: "/tmp/s.jsonl", sessionName: null };
+  const evidence = { runAnchor: { leaf_id: "leaf", started_at_ms: 10 }, shutdownCause: "signal" as const };
+  const shutdown = buildTwsStatusPayload(pane, session, "shutdown", 20, 10, null, { sessionId: "s", piPid: 1 }, evidence);
+  assert.deepEqual(shutdown.run_anchor, { leaf_id: "leaf", started_at_ms: 10 });
+  assert.equal(shutdown.shutdown_cause, "signal");
+  const working = buildTwsStatusPayload(pane, session, "working", 20, 10, null, { sessionId: "s", piPid: 1 }, evidence);
+  assert.equal(working.shutdown_cause, null);
 });

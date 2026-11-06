@@ -21,6 +21,23 @@ export type LiveSessionIdentity = {
   piPid: number;
 };
 
+/** Leaf before the run's prompt entry and the run start (agent_start). */
+export type RunAnchor = {
+  leaf_id: string | null;
+  started_at_ms: number;
+};
+
+/**
+ * Why a session_shutdown happened: a SIGHUP/SIGTERM (terminal closed, tmux server
+ * died, reboot), an interactive quit, a reload, or a session replacement.
+ */
+export type ShutdownCause = "signal" | "quit" | "reload" | "replace";
+
+export type RecoveryEvidence = {
+  runAnchor: RunAnchor | null;
+  shutdownCause: ShutdownCause | null;
+};
+
 export type TwsStatusPayload = {
   schema: 1;
   agent: "pi";
@@ -41,6 +58,9 @@ export type TwsStatusPayload = {
   updated_at_ms: number;
   started_at_ms: number | null;
   finished_at_ms: number | null;
+  // Additive recovery evidence for tmux-recovery's auto-continue decision.
+  run_anchor: RunAnchor | null;
+  shutdown_cause: ShutdownCause | null;
 };
 
 export function buildTwsStatusPayload(
@@ -51,6 +71,7 @@ export function buildTwsStatusPayload(
   startedAtMs: number | null,
   finishedAtMs: number | null,
   identity: LiveSessionIdentity,
+  evidence: RecoveryEvidence = { runAnchor: null, shutdownCause: null },
 ): TwsStatusPayload {
   return {
     schema: 1,
@@ -71,6 +92,8 @@ export function buildTwsStatusPayload(
     updated_at_ms: updatedAtMs,
     started_at_ms: startedAtMs,
     finished_at_ms: finishedAtMs,
+    run_anchor: evidence.runAnchor,
+    shutdown_cause: state === "shutdown" ? evidence.shutdownCause : null,
   };
 }
 
