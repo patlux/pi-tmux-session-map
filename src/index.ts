@@ -352,7 +352,10 @@ async function applyEventAction(
   }
   const restorePending = artifactCache.pendingRestoreReason !== null;
   if (action.refreshPane === true || !artifactCache.paneInfoResolved || (restorePending && !artifactCache.paneInfo)) {
-    artifactCache.paneInfo = restorePending ? await resolvePaneInfoForRestore() : await resolvePaneInfo();
+    const resolved = restorePending ? await resolvePaneInfoForRestore() : await resolvePaneInfo();
+    // A refresh that fails (tmux busy past its timeout) keeps the last known pane of this
+    // process. Dropping it skipped this event's status write, e.g. `working` at agent_start.
+    artifactCache.paneInfo = resolved ?? artifactCache.paneInfo;
     artifactCache.paneInfoResolved = true;
   }
   const info = artifactCache.paneInfo;

@@ -144,4 +144,4 @@ Optional environment variables for hardening or local integration:
 
 A restore acknowledgement (`PI_TMUX_RESTORE_*` environment from `pi-tmux-resume`) is written at most once per token: the first writer wins, so a later `/new` or `/reload` cannot replace the proof of what the restore resumed. A restore keeps the tmux server busy, so while the acknowledgement is pending the pane lookup is retried with growing timeouts; if every attempt fails, the next lifecycle event or reconciliation writes it.
 
-Lifecycle sidecar updates are serialized in-process, mapping and status files are written atomically, and `tmux display-message` is bounded by a short timeout so Pi lifecycle hooks do not hang indefinitely.
+Lifecycle sidecar updates are serialized in-process, mapping and status files are written atomically, and `tmux display-message` is bounded by a short timeout so Pi lifecycle hooks do not hang indefinitely. A refresh that times out keeps the last known pane of the process, so a busy tmux never drops a status write such as `working` at `agent_start`.
