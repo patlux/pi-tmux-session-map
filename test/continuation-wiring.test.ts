@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
+import type { ContinueStatus } from "../src/domain/status.ts";
 import { loadExtensionHarness, type SentMessage } from "./support/extension-harness.ts";
 
 // The extension wires the auto-continue executor (tmux-recovery
@@ -17,6 +18,18 @@ after(() => harness.cleanup());
 let counter = 0;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isContinueStatus(value: unknown): value is ContinueStatus {
+  return typeof value === "object" && value !== null && "state" in value && typeof value.state === "string"
+    && "key" in value && typeof value.key === "string" && "ledger_dir" in value && typeof value.ledger_dir === "string";
+}
+
+/** The sidecar `continue` object of a session. */
+function continueFor(sessionId: string): ContinueStatus {
+  const value = harness.readStatusFor(sessionId).continue;
+  assert.ok(isContinueStatus(value), `continue is an object: ${JSON.stringify(value)}`);
+  return value;
+}
 const json = (path: string) => JSON.parse(readFileSync(path, "utf8"));
 
 function restoredPi(id: string, slotDelayMs = 0) {
@@ -65,15 +78,41 @@ test("an acknowledged restore with a plan sends one visible continuation and adm
 
   await handlers.before_agent_start!({ messageType: "custom", message }, session.ctx);
   await handlers.agent_start!({}, session.ctx);
-  assert.equal(harness.readStatusFor(session.id).continue, "admitted");
+  assert.equal(continueFor(session.id).state, "admitted");
   await handlers.agent_end!({ messages: [{ role: "assistant", stopReason: "stop" }] }, session.ctx);
   await handlers.agent_settled!({ aborted: false }, session.ctx);
   assert.equal(json(join(ledgerDir, `${plan.key}.outcome`)).outcome, "done");
   await sleep(50);
   // found by the real-Pi layer B drill: a change of `continue` alone was deduplicated away
-  assert.equal(harness.readStatusFor(session.id).continue, "done", "the sidecar shows the final outcome");
+  assert.deepEqual(
+    continueFor(session.id),
+    { state: "done", reason: null, slot_ms: plan.slotMs, deadline_ms: plan.deadlineMs, key: plan.key, ledger_dir: ledgerDir },
+    "the sidecar shows the final outcome and the ledger entry",
+  );
   await handlers.session_shutdown!({ reason: "quit" }, session.ctx);
   assert.equal(sent.length, 1, "never a second message");
+});
+
+test("the sidecar shows the slot of a planned continuation and a TWS veto within a second", async () => {
+  const { session, plan, ledgerDir } = restoredPi("tws-veto", 3000);
+  const sent: SentMessage[] = [];
+  const handlers = harness.loadExtension(sent);
+  await handlers.session_start!({ reason: "startup" }, session.ctx);
+  await sleep(200);
+  const planned = continueFor(session.id);
+  assert.deepEqual([planned.state, planned.slot_ms, planned.key, planned.ledger_dir], ["planned", plan.slotMs, plan.key, ledgerDir]);
+  // what TWS `x` writes (tws docs/tmux-restore-anzeige.md, data contract 3)
+  const veto = { class: "veto", reason: "skipped-in-tws", atMs: Date.now(), by: "tws" };
+  writeFileSync(join(ledgerDir, `${plan.key}.skip`), `${JSON.stringify(veto)}\n`, { flag: "wx" });
+  await sleep(1300);
+  const skipped = continueFor(session.id);
+  assert.deepEqual([skipped.state, skipped.reason], ["skipped", "skipped-in-tws"], "seen before the slot");
+  assert.ok(Date.now() < plan.slotMs, "the slot has not come yet");
+  await sleep(Math.max(0, plan.slotMs - Date.now()) + 300);
+  assert.equal(sent.length, 0);
+  assert.equal(existsSync(join(ledgerDir, `${plan.key}.claim`)), false, "no claim");
+  await handlers.session_shutdown!({ reason: "quit" }, session.ctx);
+  assert.deepEqual(json(join(ledgerDir, `${plan.key}.skip`)), veto, "the veto is kept as written");
 });
 
 test("a keystroke before the slot vetoes the continuation", async () => {

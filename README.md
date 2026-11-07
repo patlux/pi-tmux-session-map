@@ -45,7 +45,18 @@ For tmux-recovery's auto-continue decision the status also carries recovery evid
 
 When tmux-recovery restores a Pi that was interrupted inside a run, its resume wrapper sets `PI_TMUX_CONTINUE_PLAN` to a plan file in the recovery ledger. Only that restored process runs the executor, once, at its `startup`, and only as the interactive pane owner for the planned session. The executor waits for the restore acknowledgement (`resumed`; a mismatch skips) and for the plan's slot, then checks the final conditions in one section under the ledger's dispatch lock: plan still released and listed in `ready.json`, mode `on`, no hold file, same session, pane and last message entry, Pi idle without pending messages, empty editor, no open dialog, no live `pi-session-watchdog` for the session. It then claims the plan with an exclusive create (`<key>.claim`, never removed) and sends one visible `tmux-recovery-continue` message with `triggerTurn`. The German text names the stop time, the elapsed time and open tool calls and asks Pi to check the actual state first; its `continuationId` matches the message details.
 
-Any real keystroke (`ctx.ui.onTerminalInput`), interactive or RPC input, extension dialog or other run before the dispatch writes a durable veto (`<key>.skip`, first writer wins). A session end before the claim writes a `process-end` skip. After the dispatch, `before_agent_start` with the matching `continuationId` writes the outcome `admitted`, and the turn's `agent_settled` writes its final state; without admission within 120 s the outcome is `uncertain`. Nothing is ever re-sent. The status sidecar shows the executor state in `continue`.
+Any real keystroke (`ctx.ui.onTerminalInput`), interactive or RPC input, extension dialog or other run before the dispatch writes a durable veto (`<key>.skip`, first writer wins). A session end before the claim writes a `process-end` skip. After the dispatch, `before_agent_start` with the matching `continuationId` writes the outcome `admitted`, and the turn's `agent_settled` writes its final state; without admission within 120 s the outcome is `uncertain`. Nothing is ever re-sent.
+
+A `<key>.skip` that another program wrote before the claim is a veto too: TWS writes `{"class": "veto", "reason": "skipped-in-tws", …}` with an exclusive create when you skip a planned continuation. The executor checks for it at least once a second while it waits for the slot or the spacing, and again inside the dispatch section; it then stops without a claim and keeps the file as written. A file it cannot read or parse also counts as a veto. A skip written after the claim has no effect, so a writer should check `<key>.claim` after its own create to know whether it came too late.
+
+The status sidecar shows the executor in `continue`, from its start on:
+
+```json
+"continue": {"state": "planned", "reason": null, "slot_ms": 1794000014000, "deadline_ms": 1794000614000,
+             "key": "<64 hex>", "ledger_dir": "/Users/…/resurrect/pi-continue/ledger"}
+```
+
+`state` is `planned`, `dispatched`, `admitted`, the turn's outcome (`done`, `failed`, `cancelled`, …), `uncertain`, `skipped` or `stopped`; `reason` is set for `skipped` and `stopped` (for example `user-active`, `skipped-in-tws`, `claimed`). `slot_ms` and `deadline_ms` come from the released plan and stay `null` until the release.
 
 The `.json` file contains the multiplexer backend, tws work state (`idle`, `working`, `retrying`, `done`, `cancelled`, `incomplete`, `failed`, `shutdown`), and pane/session metadata. A technical-error `agent_end` is provisional `retrying`; aborts and token-limit responses become `cancelled`/`incomplete` immediately. `agent_settled` confirms the final outcome (`failed` if recovery did not succeed). The extension touches the matching `agent.trigger` file after status writes so that edition refreshes within one poll tick.
 

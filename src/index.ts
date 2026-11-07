@@ -15,7 +15,7 @@ import { buildRestoreAck, restoreAckPath, restoreExpectationFromEnvironment, ser
 import { createRuntimeState, nextStatusTransition, refreshStatusTransition, type FinalWorkState, type RuntimeState, type WorkState } from "./domain/state.ts";
 import { ContinuationExecutor } from "./continuation-executor.ts";
 import { createSignalEvidenceListener, recordedTerminationSignal } from "./domain/signal-evidence.ts";
-import { buildTwsStatusPayload, serializeStatusPayload, type PaneInfo, type RecoveryEvidence, type RunAnchor, type SessionInfo, type ShutdownCause } from "./domain/status.ts";
+import { buildTwsStatusPayload, serializeStatusPayload, type ContinueStatus, type PaneInfo, type RecoveryEvidence, type RunAnchor, type SessionInfo, type ShutdownCause } from "./domain/status.ts";
 
 function execFileAsync(file: string, args: readonly string[], timeoutMs = muxTimeoutMs): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
@@ -78,7 +78,7 @@ type ArtifactCache = {
   /** In-process status of the restore acknowledgement, once known. */
   restoreAckStatus: "resumed" | "mismatch" | undefined;
   /** Auto-continue executor state for the status sidecar. */
-  continueState: () => string | null;
+  continueState: () => ContinueStatus | null;
 };
 
 export function shutdownCauseFor(reason: string, signal: string | null): ShutdownCause {
@@ -453,7 +453,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     pendingRestoreReason: null,
     runAnchor: null,
     restoreAckStatus: undefined,
-    continueState: () => executor?.state() ?? null,
+    continueState: () => executor?.status() ?? null,
   };
   const signalEvidence = createSignalEvidenceListener();
   let executor: ContinuationExecutor | undefined;

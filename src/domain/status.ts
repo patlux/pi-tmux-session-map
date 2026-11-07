@@ -33,11 +33,25 @@ export type RunAnchor = {
  */
 export type ShutdownCause = "signal" | "quit" | "reload" | "replace";
 
+/**
+ * Auto-continue state of this Pi for displays (TWS). `state`: planned, dispatched, admitted, an
+ * outcome (done, failed, cancelled, …), uncertain, skipped or stopped; `reason` for skipped and
+ * stopped. Slot and deadline come from the released plan; `key` and `ledger_dir` name the ledger
+ * entry, where TWS may veto a planned continuation with `<key>.skip`.
+ */
+export type ContinueStatus = {
+  state: string;
+  reason: string | null;
+  slot_ms: number | null;
+  deadline_ms: number | null;
+  key: string;
+  ledger_dir: string;
+};
+
 export type RecoveryEvidence = {
   runAnchor: RunAnchor | null;
   shutdownCause: ShutdownCause | null;
-  /** Auto-continue executor state for display (planned, admitted, skipped:<reason>, …). */
-  continueState?: string | null;
+  continueState?: ContinueStatus | null;
 };
 
 export type TwsStatusPayload = {
@@ -63,7 +77,7 @@ export type TwsStatusPayload = {
   // Additive recovery evidence for tmux-recovery's auto-continue decision.
   run_anchor: RunAnchor | null;
   shutdown_cause: ShutdownCause | null;
-  continue?: string;
+  continue?: ContinueStatus;
 };
 
 export function buildTwsStatusPayload(

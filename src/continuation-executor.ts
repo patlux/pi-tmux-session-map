@@ -6,11 +6,13 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import {
-  CONTINUE_CUSTOM_TYPE, acquireDispatchLock, continuationMessage, createExclusive, decide, lastDispatchMs,
+  CONTINUE_CUSTOM_TYPE, acquireDispatchLock, continuationMessage, createExclusive, decide, existingSkipReason, lastDispatchMs,
   lastMessageEntryId, readMode, readPlan, readyState, releaseDispatchLock, testCheckpoint, watchdogAlive, writeAtomicSync,
   writeOutcome, writeSkip, type ContinuePlan, type LiveFacts,
 } from "./domain/continuation.ts";
+import type { ContinueStatus } from "./domain/status.ts";
 
+/** Also the longest wait before the slot, so an outside veto shows within a second. */
 const POLL_MS = 1000;
 const LOCK_RETRY_MS = 1000;
 const ADMISSION_TIMEOUT_MS = 120_000;
@@ -45,6 +47,10 @@ export class ContinuationExecutor {
   private promptDepth = 0;
   private startedAtMs = Date.now();
   private stateValue = "planned";
+  private slotMs: number | null;
+  private deadlineMs: number | null;
+  /** End of a spacing wait decided under the dispatch lock. */
+  private waitUntilMs = 0;
   readonly planPath: string;
   readonly plan: ContinuePlan;
   private readonly live: LiveSource;
@@ -55,6 +61,8 @@ export class ContinuationExecutor {
   private constructor(planPath: string, plan: ContinuePlan, live: LiveSource, send: SendMessage, onChange: () => void, watchdogRoot: string) {
     this.planPath = planPath;
     this.plan = plan;
+    this.slotMs = plan.slotMs ?? null;
+    this.deadlineMs = plan.deadlineMs ?? null;
     this.live = live;
     this.send = send;
     this.onChange = onChange;
@@ -69,13 +77,28 @@ export class ContinuationExecutor {
     return new ContinuationExecutor(planPath, plan, live, send, onChange, env.PI_TMUX_SESSION_WATCHDOG_ROOT ?? "/tmp");
   }
 
-  /** Display value for the status sidecar `continue` field. */
+  /** Executor state as text: planned, dispatched, admitted, an outcome, skipped:<reason>, stopped:<reason>. */
   state(): string {
     return this.stateValue;
   }
 
+  /** The status sidecar `continue` field. */
+  status(): ContinueStatus {
+    const separator = this.stateValue.indexOf(":");
+    return {
+      state: separator === -1 ? this.stateValue : this.stateValue.slice(0, separator),
+      reason: separator === -1 ? null : this.stateValue.slice(separator + 1),
+      slot_ms: this.slotMs,
+      deadline_ms: this.deadlineMs,
+      key: this.plan.key,
+      ledger_dir: this.plan.ledgerDir,
+    };
+  }
+
   start(): void {
     this.startedAtMs = Date.now();
+    // Publish `planned` (with its slot, once known) so a display can show the wait.
+    this.onChange();
     this.schedule(0);
   }
 
@@ -160,6 +183,12 @@ export class ContinuationExecutor {
 
   private tick(): void {
     if (this.finished) return;
+    // A veto from outside (TWS `x`) ends the wait at once; the skip file is not ours to write.
+    const vetoReason = existingSkipReason(this.plan);
+    if (vetoReason !== null) {
+      this.finish(`skipped:${vetoReason}`);
+      return;
+    }
     const now = Date.now();
     switch (readyState(this.plan)) {
       case "waiting":
@@ -176,8 +205,15 @@ export class ContinuationExecutor {
         break;
     }
     const onDisk = readPlan(this.planPath);
+    if (onDisk?.token === this.plan.token) {
+      this.noteSlot(onDisk.slotMs ?? null, onDisk.deadlineMs ?? null);
+    }
     if (onDisk?.slotMs != null && now < onDisk.slotMs && onDisk.token === this.plan.token) {
-      this.schedule(onDisk.slotMs - now);
+      this.schedule(Math.min(onDisk.slotMs - now, POLL_MS));
+      return;
+    }
+    if (now < this.waitUntilMs) {
+      this.schedule(Math.min(this.waitUntilMs - now, POLL_MS));
       return;
     }
     this.dispatchSection(now);
@@ -199,7 +235,15 @@ export class ContinuationExecutor {
       watchdogAlive: watchdogAlive(this.plan.sessionId, this.watchdogRoot),
       mode: readMode(this.plan.configPath),
       holdPresent: existsSync(this.plan.holdFile),
+      skipReason: existingSkipReason(this.plan),
     };
+  }
+
+  private noteSlot(slotMs: number | null, deadlineMs: number | null): void {
+    if (slotMs === this.slotMs && deadlineMs === this.deadlineMs) return;
+    this.slotMs = slotMs;
+    this.deadlineMs = deadlineMs;
+    this.onChange();
   }
 
   /** One synchronous section: lock, E1-E7, claim, send, timestamp, unlock. */
@@ -222,13 +266,17 @@ export class ContinuationExecutor {
       const verdict = decide(this.plan, readPlan(this.planPath), this.facts(now), claimedBefore, lastDispatchMs(this.plan.ledgerDir));
       switch (verdict.kind) {
         case "wait":
-          this.schedule(verdict.untilMs - now);
+          this.waitUntilMs = verdict.untilMs;
+          this.schedule(Math.min(verdict.untilMs - now, POLL_MS));
           return;
         case "stop":
           this.finish(`stopped:${verdict.reason}`);
           return;
         case "skip":
           this.skip(verdict.skipClass, verdict.reason);
+          return;
+        case "vetoed":
+          this.finish(`skipped:${verdict.reason}`);
           return;
         case "dispatch":
           break;

@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 
 import { ContinuationExecutor, type LiveSource } from "../src/continuation-executor.ts";
 import {
-  acquireDispatchLock, continuationMessage, createExclusive, decide, lastMessageEntryId, releaseDispatchLock,
+  acquireDispatchLock, continuationMessage, createExclusive, decide, existingSkipReason, lastMessageEntryId, releaseDispatchLock,
   testCheckpoint, writeSkip, type ContinuePlan, type LiveFacts,
 } from "../src/domain/continuation.ts";
 
@@ -75,7 +75,7 @@ function facts(overrides: Partial<LiveFacts> = {}): LiveFacts {
   return {
     nowMs: 1000, ackResumed: true, sessionId: "sid", sessionFile: "/s.jsonl", paneKey: "s:1.0", lastMessageEntryId: "e4",
     idle: true, pendingMessages: false, editorText: "", userActive: false, promptOpen: false, watchdogAlive: false,
-    mode: "on", holdPresent: false, ...overrides,
+    mode: "on", holdPresent: false, skipReason: null, ...overrides,
   };
 }
 
@@ -98,6 +98,8 @@ test("E1-E7 decide each case with its reason", () => {
   assert.deepEqual(decide(plan, onDisk, facts({ nowMs: 400 }), false, null), { kind: "wait", untilMs: 500 });
   assert.deepEqual(decide(plan, onDisk, facts(), false, 900), { kind: "wait", untilMs: 1200 }, "spacing from the last dispatch");
   assert.deepEqual(decide(plan, onDisk, facts(), true, null), { kind: "stop", reason: "claimed" });
+  assert.deepEqual(decide(plan, onDisk, facts({ skipReason: "skipped-in-tws" }), false, null), { kind: "vetoed", reason: "skipped-in-tws" });
+  assert.deepEqual(decide(plan, onDisk, facts({ skipReason: "skipped-in-tws" }), true, null), { kind: "stop", reason: "claimed" }, "the claim beats a later veto");
   assert.deepEqual(decide(plan, { ...onDisk, state: "expired:ack" }, facts(), false, null), { kind: "stop", reason: "not-released" });
   assert.deepEqual(decide(plan, { ...onDisk, token: "rebound" }, facts(), false, null), { kind: "stop", reason: "not-released" });
 });
@@ -218,6 +220,94 @@ test("another run before the dispatch is a veto; a session end is a process-end 
   other.shutdown();
   const skip = json(join(ended.ledgerDir, `${ended.plan.key}.skip`));
   assert.deepEqual([skip.class, skip.reason], ["process-end", "session-ended"]);
+});
+
+const twsVeto = (ledgerDir: string, key: string) =>
+  writeFileSync(join(ledgerDir, `${key}.skip`), `${JSON.stringify({ class: "veto", reason: "skipped-in-tws", atMs: Date.now(), by: "tws" })}\n`, { flag: "wx" });
+
+test("existing skips are read with their reason, and a damaged one is still a veto", () => {
+  const { plan, ledgerDir } = fixture();
+  assert.equal(existingSkipReason(plan), null);
+  twsVeto(ledgerDir, plan.key);
+  assert.equal(existingSkipReason(plan), "skipped-in-tws");
+  const damaged = fixture();
+  writeFileSync(join(damaged.ledgerDir, `${damaged.plan.key}.skip`), "");
+  assert.equal(existingSkipReason(damaged.plan), "vetoed", "an empty file (still being written) counts");
+});
+
+test("a TWS veto before the claim ends the wait within a second, without a claim or a skip of its own", async () => {
+  const { plan, planPath, ledgerDir } = fixture({ slotMs: Date.now() + 3000 });
+  const sent: Sent[] = [];
+  let changes = 0;
+  const run = ContinuationExecutor.fromEnvironment(live(), (message) => sent.push({ message: message as never, at: Date.now() }), () => {
+    changes += 1;
+  }, { PI_TMUX_CONTINUE_PLAN: planPath, PI_TMUX_SESSION_WATCHDOG_ROOT: join(root, "no-watchdog") });
+  assert.ok(run);
+  run.start();
+  await sleep(100);
+  assert.deepEqual(run.status(), { state: "planned", reason: null, slot_ms: plan.slotMs, deadline_ms: plan.deadlineMs, key: plan.key, ledger_dir: ledgerDir });
+  twsVeto(ledgerDir, plan.key);
+  const vetoedAt = Date.now();
+  while (run.state() === "planned" && Date.now() - vetoedAt < 2000) await sleep(20);
+  assert.ok(Date.now() - vetoedAt <= 1100, `noticed after ${Date.now() - vetoedAt} ms`);
+  assert.deepEqual([run.status().state, run.status().reason], ["skipped", "skipped-in-tws"]);
+  assert.ok(changes >= 1, "the sidecar is refreshed");
+  run.shutdown();
+  assert.equal(sent.length, 0);
+  assert.equal(existsSync(join(ledgerDir, `${plan.key}.claim`)), false);
+  assert.equal(json(join(ledgerDir, `${plan.key}.skip`)).by, "tws", "the veto is not replaced");
+});
+
+test("a TWS veto during the spacing wait stops the dispatch", async () => {
+  const { plan, planPath, ledgerDir } = fixture({ spacingMs: 2500 });
+  writeFileSync(join(ledgerDir, ".last-dispatch"), JSON.stringify({ atMs: Date.now() }));
+  const sent: Sent[] = [];
+  const run = executor(planPath, live(), sent);
+  run.start();
+  await sleep(200);
+  assert.equal(run.state(), "planned", "waiting for the spacing");
+  twsVeto(ledgerDir, plan.key);
+  await sleep(1200);
+  assert.equal(run.state(), "skipped:skipped-in-tws");
+  await sleep(1500);
+  assert.equal(sent.length, 0);
+  assert.equal(existsSync(join(ledgerDir, `${plan.key}.claim`)), false);
+});
+
+test("a veto after the claim has no effect", async () => {
+  const { plan, planPath, ledgerDir } = fixture();
+  const sent: Sent[] = [];
+  const run = executor(planPath, live(), sent);
+  run.start();
+  await sleep(150);
+  assert.equal(run.state(), "dispatched");
+  assert.equal(writeSkip(plan, "veto", "skipped-in-tws"), false, "the domain refuses a skip after a claim");
+  twsVeto(ledgerDir, plan.key); // a writer that ignores the claim
+  run.beforeAgentStart({ messageType: "custom", message: { customType: "tmux-recovery-continue", details: { continuationId: run.continuationId } } });
+  run.agentSettled("done");
+  assert.equal(sent.length, 1);
+  assert.equal(run.status().state, "done");
+  assert.equal(json(join(ledgerDir, `${plan.key}.outcome`)).outcome, "done");
+});
+
+test("the status follows the slot of the released plan", async () => {
+  const { plan, planPath } = fixture({ state: "planned", slotMs: null, deadlineMs: null }, false);
+  let changes = 0;
+  const run = ContinuationExecutor.fromEnvironment(live({ ackResumed: () => undefined }), () => undefined, () => {
+    changes += 1;
+  }, { PI_TMUX_CONTINUE_PLAN: planPath, PI_TMUX_SESSION_WATCHDOG_ROOT: join(root, "no-watchdog") });
+  assert.ok(run);
+  run.start();
+  assert.equal(changes, 1, "start publishes the planned state");
+  await sleep(100);
+  assert.deepEqual([run.status().slot_ms, run.status().deadline_ms], [null, null]);
+  const slot = Date.now() + 5000;
+  writeFileSync(planPath, JSON.stringify({ ...plan, state: "released", slotMs: slot, deadlineMs: slot + 600_000 }));
+  writeFileSync(plan.readyPath, JSON.stringify({ tokens: { [plan.token]: { key: plan.key } } }));
+  await sleep(1200);
+  assert.deepEqual([run.status().state, run.status().slot_ms, run.status().deadline_ms], ["planned", slot, slot + 600_000]);
+  assert.equal(changes, 2, "one refresh for the new slot");
+  run.shutdown();
 });
 
 test("a ready.json without this token stops without sending", async () => {

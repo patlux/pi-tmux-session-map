@@ -123,6 +123,34 @@ export function writeSkip(plan: ContinuePlan, skipClass: SkipClass, reason: stri
   );
 }
 
+/**
+ * Reason of an existing `K.skip` from any writer, for example a veto from TWS
+ * (`{"class": "veto", "reason": "skipped-in-tws", …}`); null without one. A
+ * file that cannot be read or parsed still counts as a veto (fail closed).
+ */
+export function existingSkipReason(plan: ContinuePlan): string | null {
+  const path = join(plan.ledgerDir, `${plan.key}.skip`);
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    return isErrno(error, "ENOENT") ? null : "vetoed";
+  }
+  try {
+    const value: unknown = JSON.parse(text);
+    if (typeof value === "object" && value !== null && "reason" in value && typeof value.reason === "string" && value.reason !== "") {
+      return value.reason;
+    }
+  } catch {
+    // a skip that is still being written or is damaged is a veto without a reason
+  }
+  return "vetoed";
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
 export function writeOutcome(plan: ContinuePlan, outcome: string, continuationId: string, extra: Record<string, unknown> = {}): void {
   writeAtomicSync(
     join(plan.ledgerDir, `${plan.key}.outcome`),
@@ -223,13 +251,17 @@ export type LiveFacts = {
   watchdogAlive: boolean;
   mode: string;
   holdPresent: boolean;
+  /** Reason of a `K.skip` that another writer (TWS) created; null without one. */
+  skipReason: string | null;
 };
 
 export type Verdict =
   | { kind: "dispatch" }
   | { kind: "wait"; untilMs: number }
   | { kind: "skip"; skipClass: SkipClass; reason: string }
-  | { kind: "stop"; reason: string };
+  | { kind: "stop"; reason: string }
+  /** An existing `K.skip` decided it already; nothing more is written. */
+  | { kind: "vetoed"; reason: string };
 
 /** E1-E7 against the plan as currently on disk. Caller holds the dispatch lock (E7). */
 export function decide(plan: ContinuePlan, onDisk: ContinuePlan | undefined, facts: LiveFacts, ledgerHasClaim: boolean, lastDispatch: number | null): Verdict {
@@ -238,6 +270,8 @@ export function decide(plan: ContinuePlan, onDisk: ContinuePlan | undefined, fac
   // E7: plan state, claim, deadline, spacing
   if (!onDisk || onDisk.token !== plan.token || onDisk.state !== "released") return { kind: "stop", reason: "not-released" };
   if (ledgerHasClaim) return { kind: "stop", reason: "claimed" };
+  // A veto from outside (TWS) counts until the claim; after the claim it has no effect.
+  if (facts.skipReason !== null) return { kind: "vetoed", reason: facts.skipReason };
   if (onDisk.deadlineMs !== null && facts.nowMs > onDisk.deadlineMs) return { kind: "skip", skipClass: "process-end", reason: "timeout" };
   if (onDisk.slotMs !== null && facts.nowMs < onDisk.slotMs) return { kind: "wait", untilMs: onDisk.slotMs };
   if (lastDispatch !== null && facts.nowMs < lastDispatch + plan.spacingMs) return { kind: "wait", untilMs: lastDispatch + plan.spacingMs };
