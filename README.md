@@ -4,6 +4,8 @@ A [pi](https://pi.dev) extension that records which Pi session runs in which tmu
 
 It also writes [tws](https://github.com/ytaskiran/tws)-compatible Pi work-status sidecar files for both tmux and Zellij, so each TWS edition can distinguish working, retrying, successful, cancelled, incomplete, and failed Pi runs.
 
+Both work on their own with tmux-resurrect and the wrapper below. The [tmux-recovery integration](#optional-tmux-recovery-integration), which continues a Pi run that a tmux restart interrupted, needs tmux-recovery, which is not public at the moment. Without it, that code stays inactive.
+
 ## Problem
 
 `pi --continue` resumes the most recent session for the current directory. When tmux-resurrect restores panes with a blanket `pi --continue`, every pane in the same directory gets the same (newest) session — the wrong one for all but one pane.
@@ -38,25 +40,6 @@ exists. Consumers must match the foreground Pi PID, tmux server and pane, reject
 shutdown/stale status, and revalidate before copying. The session ID is therefore
 available before the first message; a resume command still requires a matching
 on-disk header. The durable `.session` mappings retain their persistence checks.
-
-For tmux-recovery's auto-continue decision the status also carries recovery evidence. `run_anchor` (`{ leaf_id, started_at_ms }`) is set at the `agent_start` that begins a run: `leaf_id` is the session leaf before the run's prompt entry, captured synchronously because Pi persists the prompt after `agent_start`. Retries keep the anchor; final states and `idle` clear it. On `shutdown`, `shutdown_cause` is `signal` when the process received SIGHUP or SIGTERM (closed terminal, dead tmux server, reboot), `quit` for an interactive quit, `reload`, or `replace` for `/new`, `/resume` and fork. Only the interactive pane owner installs the signal listener, and the cause is resolved when the queued write builds its payload, after the signal dispatch has finished. A graceful signal shutdown can still leave `working` or `retrying` when Pi exits on a dead terminal before the write lands.
-
-### Auto-continue executor
-
-When tmux-recovery restores a Pi that was interrupted inside a run, its resume wrapper sets `PI_TMUX_CONTINUE_PLAN` to a plan file in the recovery ledger. Only that restored process runs the executor, once, at its `startup`, and only as the interactive pane owner for the planned session. The executor waits for the restore acknowledgement (`resumed`; a mismatch skips) and for the plan's slot, then checks the final conditions in one section under the ledger's dispatch lock: plan still released and listed in `ready.json`, mode `on`, no hold file, same session, pane and last message entry, Pi idle without pending messages, empty editor, no open dialog, no live `pi-session-watchdog` for the session. It then claims the plan with an exclusive create (`<key>.claim`, never removed) and sends one visible `tmux-recovery-continue` message with `triggerTurn`. The German text names the stop time, the elapsed time and open tool calls and asks Pi to check the actual state first; its `continuationId` matches the message details.
-
-Any real keystroke (`ctx.ui.onTerminalInput`), interactive or RPC input, extension dialog or other run before the dispatch writes a durable veto (`<key>.skip`, first writer wins). A session end before the claim writes a `process-end` skip. After the dispatch, `before_agent_start` with the matching `continuationId` writes the outcome `admitted`, and the turn's `agent_settled` writes its final state; without admission within 120 s the outcome is `uncertain`. Nothing is ever re-sent.
-
-A `<key>.skip` that another program wrote before the claim is a veto too: TWS writes `{"class": "veto", "reason": "skipped-in-tws", …}` with an exclusive create when you skip a planned continuation. The executor checks for it at least once a second while it waits for the slot or the spacing, and again inside the dispatch section; it then stops without a claim and keeps the file as written. A file it cannot read or parse also counts as a veto. A skip written after the claim has no effect, so a writer should check `<key>.claim` after its own create to know whether it came too late.
-
-The status sidecar shows the executor in `continue`, from its start on:
-
-```json
-"continue": {"state": "planned", "reason": null, "slot_ms": 1794000014000, "deadline_ms": 1794000614000,
-             "key": "<64 hex>", "ledger_dir": "/Users/…/resurrect/pi-continue/ledger"}
-```
-
-`state` is `planned`, `dispatched`, `admitted`, the turn's outcome (`done`, `failed`, `cancelled`, …), `uncertain`, `skipped` or `stopped`; `reason` is set for `skipped` and `stopped` (for example `user-active`, `skipped-in-tws`, `claimed`). `slot_ms` and `deadline_ms` come from the released plan and stay `null` until the release.
 
 The `.json` file contains the multiplexer backend, tws work state (`idle`, `working`, `retrying`, `done`, `cancelled`, `incomplete`, `failed`, `shutdown`), and pane/session metadata. A technical-error `agent_end` is provisional `retrying`; aborts and token-limit responses become `cancelled`/`incomplete` immediately. `agent_settled` confirms the final outcome (`failed` if recovery did not succeed). The extension touches the matching `agent.trigger` file after status writes so that edition refreshes within one poll tick.
 
@@ -134,6 +117,35 @@ If the recorded session file no longer exists, the wrapper falls back to `pi --c
 - Pane IDs are scoped to one tmux server and may be reused after restart. Schema 3 therefore includes the tmux server PID and consumers require both values before using a live alias.
 - A Pi process without a valid on-disk JSONL has a live identity but no durable resume mapping. The extension waits for persistence before publishing a resume alias; it never creates session history merely to make a command available.
 
+## Optional: tmux-recovery integration
+
+This part works only together with tmux-recovery, a restore tool that is not public at the moment. Without its resume wrapper, Pi gets no restore token and no continuation plan: no acknowledgement is written, the executor does not start and the status has no `continue` field. Two things stay active in every interactive pane owner: the recovery evidence fields `run_anchor` and `shutdown_cause` in the status, and a SIGHUP/SIGTERM listener for `shutdown_cause`. The TWS skip action described below exists in a TWS fork, not in upstream tws.
+
+### Recovery evidence
+
+For tmux-recovery's auto-continue decision the status carries recovery evidence. `run_anchor` (`{ leaf_id, started_at_ms }`) is set at the `agent_start` that begins a run: `leaf_id` is the session leaf before the run's prompt entry, captured synchronously because Pi persists the prompt after `agent_start`. Retries keep the anchor; final states and `idle` clear it. On `shutdown`, `shutdown_cause` is `signal` when the process received SIGHUP or SIGTERM (closed terminal, dead tmux server, reboot), `quit` for an interactive quit, `reload`, or `replace` for `/new`, `/resume` and fork. Only the interactive pane owner installs the signal listener, and the cause is resolved when the queued write builds its payload, after the signal dispatch has finished. A graceful signal shutdown can still leave `working` or `retrying` when Pi exits on a dead terminal before the write lands.
+
+### Restore acknowledgement
+
+A restore acknowledgement (`PI_TMUX_RESTORE_*` environment from tmux-recovery's `pi-tmux-resume`, not from the wrapper above) is written at most once per token: the first writer wins, so a later `/new` or `/reload` cannot replace the proof of what the restore resumed. A restore keeps the tmux server busy, so while the acknowledgement is pending the pane lookup is retried with growing timeouts; if every attempt fails, the next lifecycle event or reconciliation writes it.
+
+### Auto-continue executor
+
+When tmux-recovery restores a Pi that was interrupted inside a run, its resume wrapper sets `PI_TMUX_CONTINUE_PLAN` to a plan file in the recovery ledger. Only that restored process runs the executor, once, at its `startup`, and only as the interactive pane owner for the planned session. The executor waits for the restore acknowledgement (`resumed`; a mismatch skips) and for the plan's slot, then checks the final conditions in one section under the ledger's dispatch lock: plan still released and listed in `ready.json`, mode `on`, no hold file, same session, pane and last message entry, Pi idle without pending messages, empty editor, no open dialog, no live `pi-session-watchdog` for the session. It then claims the plan with an exclusive create (`<key>.claim`, never removed) and sends one visible `tmux-recovery-continue` message with `triggerTurn`. The German text names the stop time, the elapsed time and open tool calls and asks Pi to check the actual state first; its `continuationId` matches the message details.
+
+Any real keystroke (`ctx.ui.onTerminalInput`), interactive or RPC input, extension dialog or other run before the dispatch writes a durable veto (`<key>.skip`, first writer wins). A session end before the claim writes a `process-end` skip. After the dispatch, `before_agent_start` with the matching `continuationId` writes the outcome `admitted`, and the turn's `agent_settled` writes its final state; without admission within 120 s the outcome is `uncertain`. Nothing is ever re-sent.
+
+A `<key>.skip` that another program wrote before the claim is a veto too: TWS writes `{"class": "veto", "reason": "skipped-in-tws", …}` with an exclusive create when you skip a planned continuation. The executor checks for it at least once a second while it waits for the slot or the spacing, and again inside the dispatch section; it then stops without a claim and keeps the file as written. A file it cannot read or parse also counts as a veto. A skip written after the claim has no effect, so a writer should check `<key>.claim` after its own create to know whether it came too late.
+
+The status sidecar shows the executor in `continue`, from its start on:
+
+```json
+"continue": {"state": "planned", "reason": null, "slot_ms": 1794000014000, "deadline_ms": 1794000614000,
+             "key": "<64 hex>", "ledger_dir": "/Users/…/resurrect/pi-continue/ledger"}
+```
+
+`state` is `planned`, `dispatched`, `admitted`, the turn's outcome (`done`, `failed`, `cancelled`, …), `uncertain`, `skipped` or `stopped`; `reason` is set for `skipped` and `stopped` (for example `user-active`, `skipped-in-tws`, `claimed`). `slot_ms` and `deadline_ms` come from the released plan and stay `null` until the release.
+
 ## License
 
 MIT
@@ -147,12 +159,10 @@ Optional environment variables for hardening or local integration:
 - `PI_TMUX_SESSION_MAP_TWS_STATUS_DIR` — override only the tws status directory.
 - `PI_TMUX_SESSION_MAP_TWS_TRIGGER_FILE` — override the tws trigger file.
 - `PI_TMUX_SESSION_MAP_TMUX_BIN` — override the `tmux` binary path.
-- `PI_TMUX_SESSION_MAP_RESTORE_PANE_TIMEOUTS_MS` — comma-separated `tmux display-message` timeouts while a restore acknowledgement is pending; default `1000,2000,4000,8000,16000`.
+- `PI_TMUX_SESSION_MAP_RESTORE_PANE_TIMEOUTS_MS` — comma-separated `tmux display-message` timeouts while a tmux-recovery restore acknowledgement is pending; default `1000,2000,4000,8000,16000`.
 - `PI_TMUX_SESSION_MAP_RECONCILE_INTERVAL_MS` — periodic mapping reconciliation interval; minimum 10 seconds, default 60 seconds, deterministically jittered per pane.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_BIN` — override the `zellij` binary path.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_STATUS_DIR` — override the Zellij TWS status directory.
 - `PI_TMUX_SESSION_MAP_ZELLIJ_TRIGGER_FILE` — override the Zellij TWS trigger file.
-
-A restore acknowledgement (`PI_TMUX_RESTORE_*` environment from `pi-tmux-resume`) is written at most once per token: the first writer wins, so a later `/new` or `/reload` cannot replace the proof of what the restore resumed. A restore keeps the tmux server busy, so while the acknowledgement is pending the pane lookup is retried with growing timeouts; if every attempt fails, the next lifecycle event or reconciliation writes it.
 
 Lifecycle sidecar updates are serialized in-process, mapping and status files are written atomically, and `tmux display-message` is bounded by a short timeout so Pi lifecycle hooks do not hang indefinitely. A refresh that times out keeps the last known pane of the process, so a busy tmux never drops a status write such as `working` at `agent_start`.
