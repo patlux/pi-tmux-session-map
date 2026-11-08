@@ -2,7 +2,7 @@
 // The extension reads its configuration at import time, so call
 // `loadExtensionHarness()` before anything else imports src/index.ts.
 
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,12 +26,21 @@ export async function loadExtensionHarness(paneKey = "tws_fixture_main:1.0") {
   const root = mkdtempSync(join(tmpdir(), "pi-tmux-ext-"));
   const failures = join(root, "remaining-failures");
   const fakeTmux = join(root, "tmux");
+  const prefill = join(root, "editor-prefill");
+  const prefillCalls = join(root, "editor-prefill-calls");
   writeFileSync(failures, "0");
+  writeFileSync(prefillCalls, "");
   const [session, rest] = paneKey.split(":");
   const [window, pane] = (rest ?? "1.0").split(".");
   // While `remaining-failures` is positive, a call decrements it and hangs past
   // the extension's timeout, like a tmux server busy with a restore.
+  // The editor prefill pane option lives in `editor-prefill`; its calls are
+  // logged and never use up a simulated failure.
   writeFileSync(fakeTmux, `#!/bin/sh
+case "$1" in
+  show-options) echo "$*" >> '${prefillCalls}'; [ -f '${prefill}' ] && cat '${prefill}'; exit 0 ;;
+  set-option) echo "$*" >> '${prefillCalls}'; rm -f '${prefill}'; exit 0 ;;
+esac
 remaining=$(cat '${failures}')
 if [ "$remaining" -gt 0 ]; then
   echo $((remaining - 1)) > '${failures}'
@@ -59,6 +68,17 @@ printf '${paneKey}\\t${session}\\t${window}\\t${pane}\\t4242\\n'
     statusDir: join(root, "tws", "pi-status"),
     setTmuxFailures(count: number) {
       writeFileSync(failures, String(count));
+    },
+    /** Set the pane's editor prefill as tmux prints it, with its newline. */
+    setEditorPrefill(text: string) {
+      writeFileSync(prefill, `${text}\n`);
+    },
+    editorPrefillSet(): boolean {
+      return existsSync(prefill);
+    },
+    /** tmux calls for the prefill, one argument string per call. */
+    editorPrefillCalls(): string[] {
+      return readFileSync(prefillCalls, "utf8").split("\n").filter((line) => line.length > 0);
     },
     loadExtension(sent: SentMessage[] = []): Record<string, Handler> {
       const handlers: Record<string, Handler> = {};
@@ -95,6 +115,7 @@ printf '${paneKey}\\t${session}\\t${window}\\t${pane}\\t4242\\n'
         hasPendingMessages: () => false,
         ui: {
           getEditorText: () => fake.editorText,
+          setEditorText: (text: string) => { fake.editorText = text; },
           onTerminalInput: (handler: (data: string) => unknown) => {
             fake.terminalInput.push(handler);
             return () => undefined;

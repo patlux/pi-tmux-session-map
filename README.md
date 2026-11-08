@@ -112,6 +112,10 @@ The exact session mapping and pane-scoped tws status are written only when Pi is
 
 If the recorded session file no longer exists, the wrapper falls back to `pi --continue` for the pane's working directory.
 
+### Editor prefill
+
+TWS's command palette ("New Pi with reference") starts a new Pi without waiting for it. It sets the tmux pane option `@pi-editor-prefill` on the new pane, types `pi` there and closes. At `startup`, the interactive pane owner reads that option, clears it and puts its text into the editor, in front of anything typed while Pi was starting. The text is never submitted. The option is one-shot: a later Pi in the same pane starts with an empty editor, and `/new`, `/resume`, fork and reload never read it. A Pi restored by tmux-recovery (`PI_TMUX_RESTORE_TOKEN`) skips the check. If the option cannot be cleared, the text is not used.
+
 ## Caveats
 
 - Pane IDs are scoped to one tmux server and may be reused after restart. Schema 3 therefore includes the tmux server PID and consumers require both values before using a live alias.

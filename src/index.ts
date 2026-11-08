@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { cleanupStaleSessionMappings, cleanupStaleTempFiles, cleanupSupersededStatusFiles, ensureDirectory, writeAtomic, writeAtomicExclusive } from "./domain/atomic-write.ts";
 import { createAsyncQueue } from "./domain/async-queue.ts";
+import { prefilledEditorText, takeEditorPrefill } from "./domain/editor-prefill.ts";
 import { createThrottledErrorReporter } from "./domain/error-reporter.ts";
 import { publishSessionMapping } from "./domain/mapping-publisher.ts";
 import { PANE_KEY_FORMAT, defaultStateDir, statusFileName } from "./domain/pane-key.ts";
@@ -471,6 +472,25 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
     });
   };
 
+  // TWS's "New Pi with reference" leaves the editor text as a one-shot pane
+  // option; it is never submitted.
+  const applyEditorPrefill = async (ctx: ExtensionContext) => {
+    const paneId = process.env.TMUX_PANE;
+    // A restored Pi was started by the restore engine, not by TWS; skipping
+    // it spares a tmux server that is busy recreating panes.
+    if (!process.env.TMUX || !paneId || process.env.PI_TMUX_RESTORE_TOKEN !== undefined) {
+      return;
+    }
+    try {
+      const text = await takeEditorPrefill(async (args) => (await execFileAsync(tmuxBin, args)).stdout, paneId);
+      if (text !== null) {
+        ctx.ui.setEditorText(prefilledEditorText(text, ctx.ui.getEditorText() ?? ""));
+      }
+    } catch (error) {
+      errorReporter.report("pi-tmux-session-map: failed to take the editor prefill", error);
+    }
+  };
+
   let reconciliationTimer: ReturnType<typeof setTimeout> | undefined;
   let reconciliationActive = false;
 
@@ -512,6 +532,11 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
   // Intentionally no cleanup on session_shutdown: the mapping must survive a
   // tmux server restart so resurrect can restore the exact session.
   pi.on("session_start", async (event, ctx) => {
+    // Only the visible interactive Pi owns the pane; print, RPC and headless
+    // children never install a signal listener or take the editor prefill.
+    const ownsPane = ownsInteractivePane(paneOwnershipEvidence(ctx.mode, process.stdin.isTTY));
+    // First, so the text appears as soon as possible after Pi's editor.
+    const prefill = ownsPane && event.reason === "startup" ? applyEditorPrefill(ctx) : Promise.resolve();
     artifactCache.paneInfo = undefined;
     artifactCache.paneInfoResolved = false;
     artifactCache.mappingSignature = null;
@@ -526,9 +551,6 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
       restoreReason: event.reason,
       refreshPane: true,
     });
-    // Only the visible interactive Pi owns the pane; print, RPC and headless
-    // children never install a signal listener.
-    const ownsPane = ownsInteractivePane(paneOwnershipEvidence(ctx.mode, process.stdin.isTTY));
     if (ownsPane) {
       signalEvidence.install();
     }
@@ -562,6 +584,7 @@ export default function tmuxSessionMap(pi: ExtensionAPI) {
       }
     }
     startReconciliation(ctx);
+    await prefill;
   });
   pi.on("input", (event) => {
     if (event.source !== "extension") {
