@@ -6,7 +6,7 @@
 // Exclusivity: O_EXCL files only. `K.claim` is created with "wx" and never
 // removed; `K.skip` is first-writer-wins, so a veto is never downgraded; the
 // global dispatch lock is a hard link of a fully written file and is only
-// removed by its owner (inode check) or by the restore engine's reconciler.
+// removed by its owner (inode and continuation identity) or the restore engine's reconciler.
 // Everything here is synchronous so a dispatch decision cannot interleave with
 // user input or another turn in this process.
 
@@ -160,7 +160,7 @@ export function writeOutcome(plan: ContinuePlan, outcome: string, continuationId
 
 // -- dispatch lock -----------------------------------------------------------
 
-export type DispatchLock = { path: string; inode: number };
+export type DispatchLock = { path: string; inode: number; continuationId: string };
 
 export function acquireDispatchLock(ledgerDir: string, continuationId: string): DispatchLock | undefined {
   const path = join(ledgerDir, "dispatch.lock");
@@ -172,6 +172,7 @@ export function acquireDispatchLock(ledgerDir: string, continuationId: string): 
   } finally {
     closeSync(fd);
   }
+  const inode = statSync(tmp).ino;
   try {
     linkSync(tmp, path);
   } catch (error) {
@@ -182,12 +183,17 @@ export function acquireDispatchLock(ledgerDir: string, continuationId: string): 
   } finally {
     unlinkSync(tmp);
   }
-  return { path, inode: statSync(path).ino };
+  return { path, inode, continuationId };
 }
 
 export function releaseDispatchLock(lock: DispatchLock): void {
   try {
-    if (statSync(lock.path).ino === lock.inode) {
+    if (statSync(lock.path).ino !== lock.inode) return;
+    // Filesystems may recycle an unlinked inode immediately; the identity must match too.
+    const owner: unknown = JSON.parse(readFileSync(lock.path, "utf8"));
+    if (typeof owner === "object" && owner !== null
+      && "continuationId" in owner && owner.continuationId === lock.continuationId
+      && "pid" in owner && owner.pid === process.pid) {
       unlinkSync(lock.path);
     }
   } catch {

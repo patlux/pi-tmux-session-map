@@ -132,6 +132,24 @@ test("the dispatch lock admits one holder and is removed only by its owner", () 
   assert.equal(existsSync(join(ledgerDir, "dispatch.lock")), false);
 });
 
+test("a successor's dispatch lock survives even when its inode is reused", () => {
+  const { ledgerDir } = fixture();
+  const first = acquireDispatchLock(ledgerDir, "first");
+  assert.ok(first);
+  rmSync(join(ledgerDir, "dispatch.lock"));
+  const successor = acquireDispatchLock(ledgerDir, "successor");
+  assert.ok(successor);
+  try {
+    // Model immediate inode reuse independently of the host filesystem's allocator.
+    releaseDispatchLock({ ...first, inode: successor.inode });
+    assert.equal(existsSync(join(ledgerDir, "dispatch.lock")), true, "the successor's lock survives");
+    assert.equal(json(join(ledgerDir, "dispatch.lock")).continuationId, "successor");
+  } finally {
+    releaseDispatchLock(successor);
+  }
+  assert.equal(existsSync(join(ledgerDir, "dispatch.lock")), false, "the actual owner releases it");
+});
+
 test("the continuation message states the stop, the elapsed time and the open tool call", () => {
   const { plan } = fixture();
   const text = continuationMessage(plan, plan.interruptedAtMs! + 14 * 86_400_000, "cid-1");
