@@ -1,6 +1,6 @@
 {
   "name": "pi-tmux-session-map",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Map Pi sessions to tmux panes and publish TWS work status for tmux and Zellij.",
   "type": "module",
   "exports": {
