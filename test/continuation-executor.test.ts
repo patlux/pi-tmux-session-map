@@ -347,6 +347,24 @@ test("two executors of one key send once; executors of two keys keep the spacing
   assert.ok(spaced[1]!.at - spaced[0]!.at >= first.plan.spacingMs - 5, `gap ${spaced[1]!.at - spaced[0]!.at} ms`);
 });
 
+test("the spacing timestamp follows completion of a slow send", async () => {
+  const { planPath, ledgerDir } = fixture();
+  const sent: Sent[] = [];
+  const run = executor(planPath, live(), sent, () => {
+    // Model synchronous work during send without letting another timer interleave.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
+  });
+  try {
+    run.start();
+    await sleep(150);
+    assert.equal(sent.length, 1);
+    const dispatchedAt = json(join(ledgerDir, ".last-dispatch")).atMs;
+    assert.ok(dispatchedAt >= sent[0]!.at, "spacing starts only after the send completes");
+  } finally {
+    run.shutdown();
+  }
+});
+
 test("a claim taken after the pre-check wins over this executor (O_EXCL)", async () => {
   const { plan, planPath, ledgerDir } = fixture();
   const claimPath = join(ledgerDir, `${plan.key}.claim`);

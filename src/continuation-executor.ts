@@ -305,7 +305,8 @@ export class ContinuationExecutor {
         writeOutcome(this.plan, "uncertain", this.continuationId, { reason: `send failed: ${String(error)}` });
         this.setState("uncertain");
       }
-      writeAtomicSync(join(this.plan.ledgerDir, ".last-dispatch"), `${JSON.stringify({ atMs: now, pid: process.pid, continuationId: this.continuationId })}\n`);
+      // Start the spacing after the send: lock, filesystem and send work may be slow.
+      writeAtomicSync(join(this.plan.ledgerDir, ".last-dispatch"), `${JSON.stringify({ atMs: Date.now(), pid: process.pid, continuationId: this.continuationId })}\n`);
       this.finished = true;
     } finally {
       releaseDispatchLock(lock);
